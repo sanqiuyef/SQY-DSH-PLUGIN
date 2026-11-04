@@ -28,8 +28,8 @@ import { createSettingsStore, normalizeMode } from './settings.js'
 /** Loader entry id, matching this bundle's `cordis.patch.yml`. */
 export const name = 'tool-search-mode'
 
-/** Host services this plugin needs; `webServer`/`connection` are optional at runtime. */
-export const inject = ['tools']
+/** Host services this plugin needs. Cordis requires an injected name before `ctx.<name>` can be read. */
+export const inject = ['tools', 'webServer', 'connection']
 
 function positiveInt(value, fallback) {
   return Number.isFinite(value) && value > 0 ? Math.trunc(value) : fallback

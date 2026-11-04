@@ -1,6 +1,6 @@
 {
   "name": "dsh-tool-search-mode",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "ZCode-style tool search for DeepSeek Harness — auto/local/off modes that keep the model-visible tool catalog small and load deferred tools on demand. · DSH 工具搜索（自动/本地/关闭）",
   "type": "module",
   "main": "lib/index.js",

@@ -24,7 +24,7 @@ import {
 } from '../lib/catalog.js'
 import { createEngine } from '../lib/engine.js'
 import { createSettingsStore, normalizeMode } from '../lib/settings.js'
-import { apply, resolveConfig } from '../lib/index.js'
+import { apply, inject, resolveConfig } from '../lib/index.js'
 
 let checks = 0
 async function check(name, fn) {
@@ -238,6 +238,10 @@ await check('PTC-only and tool-less assemblies are left alone', () => {
 })
 
 /* ------------------------------------------------------------ apply + tools */
+
+await check('apply declares its injected services', () => {
+  assert.deepEqual([...inject].sort(), ['connection', 'tools', 'webServer'])
+})
 
 await check('apply registers the listener, both bridge tools, and the state route', () => {
   const { ctx, registered, listeners, routes } = fakeCtx(CATALOG)
