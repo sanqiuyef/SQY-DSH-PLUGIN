@@ -64,6 +64,15 @@ const META = {
     category: 'market',
     keywords: ['plugins', 'marketplace', 'zcode-plugins', 'projection'],
   },
+  'dsh-tool-search-mode': {
+    title: { zh: '工具搜索', en: 'Tool Search' },
+    description: {
+      zh: 'ZCode 式工具搜索：自动/本地/关闭三模式，把模型可见工具目录收缩为核心工具 + 延迟目录清单，其余工具经 tool_search 按需加载、tool_call 同轮执行；模式按会话快照生效。',
+      en: 'ZCode-style tool search: auto/local/off modes that shrink the model-visible catalog to core tools plus a deferred manifest; other tools load on demand through tool_search and run in the same turn via tool_call. The mode is captured per session.',
+    },
+    category: 'mcp',
+    keywords: ['tool-search', 'context', 'token-saving', 'progressive-disclosure', 'settings'],
+  },
 };
 
 const ICON_OWNERS = new Set(['dsh-skill-manager', 'dsh-plugin-hub']);
@@ -98,8 +107,8 @@ const index = {
   format: 1,
   title: { zh: 'SQY DSH 插件集', en: 'SQY DSH Plugins' },
   description: {
-    zh: 'sanqiuyef 自研的 DeepSeek Harness 插件集合（MCP 管理 / 记忆 / 工具网关 / 技能管理 / 插件中心）。',
-    en: 'A collection of DeepSeek Harness plugins by sanqiuyef (MCP manager, memory, tool gateway, skill manager, plugin hub).',
+    zh: 'sanqiuyef 自研的 DeepSeek Harness 插件集合（MCP 管理 / 记忆 / 工具网关 / 技能管理 / 插件中心 / 工具搜索）。',
+    en: 'A collection of DeepSeek Harness plugins by sanqiuyef (MCP manager, memory, tool gateway, skill manager, plugin hub, tool search).',
   },
   metadata: {
     categories: {

@@ -1,0 +1,61 @@
+{
+  "name": "dsh-tool-search-mode",
+  "version": "0.1.0",
+  "description": "ZCode-style tool search for DeepSeek Harness — auto/local/off modes that keep the model-visible tool catalog small and load deferred tools on demand. · DSH 工具搜索（自动/本地/关闭）",
+  "type": "module",
+  "main": "lib/index.js",
+  "license": "MIT",
+  "keywords": [
+    "dsh",
+    "deepseek-harness",
+    "plugin",
+    "tool-search",
+    "context",
+    "token-saver"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/sanqiuyef/dsh-tool-search-mode.git"
+  },
+  "homepage": "https://github.com/sanqiuyef/dsh-tool-search-mode#readme",
+  "bugs": {
+    "url": "https://github.com/sanqiuyef/dsh-tool-search-mode/issues"
+  },
+  "engines": {
+    "node": ">=20",
+    "dsh": ">=0.2.1-rc.2"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "^4.0.1"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": [
+        "@deepseek-ai/dsh-client-locale",
+        "@deepseek-ai/dsh-client-ui-settings"
+      ]
+    }
+  },
+  "exports": {
+    ".": "./lib/index.js",
+    "./client": "./client/client.js",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib",
+    "client",
+    "cordis.patch.yml",
+    "README.md",
+    "package.json"
+  ],
+  "scripts": {
+    "smoke": "node scripts/smoke.mjs",
+    "selfcheck": "node client/selfcheck.mjs"
+  }
+}

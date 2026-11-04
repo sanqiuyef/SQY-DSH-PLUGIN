@@ -1,0 +1,8 @@
+# dsh-tool-search-mode bundle patch
+#
+# 只插入本插件自己的一行宿主条目；模式设置落在 $DSH_HOME/data/dsh-tool-search-mode/settings.json。
+- insert:
+    - id: tool-search-mode
+      name: 'dsh-tool-search-mode'
+      config:
+        mode: auto
