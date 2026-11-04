@@ -18,6 +18,17 @@
 
 要求：DSH **0.2.1-rc.1 及以上**（桌面端 0.2.1-rc.5 实测）。
 
+### 作为插件市场索引（推荐）
+
+DSH 的「插件 → 发现 → 索引源」添加以下 **JSON 索引 URL**（不是仓库网页地址）：
+
+- GitHub Pages：`https://sanqiuyef.github.io/SQY-DSH-PLUGIN/index.json`
+- jsDelivr 镜像：`https://cdn.jsdelivr.net/gh/sanqiuyef/SQY-DSH-PLUGIN@main/index.json`
+
+索引为 format-1 市场格式，版本来源是 git 提交（`source: git` + 精确 commit），安装时会固定到该提交。
+
+### 从源码打包安装
+
 ```powershell
 # 1) 克隆并打包（每个目录独立打包）
 git clone https://github.com/sanqiuyef/SQY-DSH-PLUGIN

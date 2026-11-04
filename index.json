@@ -1,0 +1,265 @@
+{
+  "format": 1,
+  "title": {
+    "zh": "SQY DSH 插件集",
+    "en": "SQY DSH Plugins"
+  },
+  "description": {
+    "zh": "sanqiuyef 自研的 DeepSeek Harness 插件集合（MCP 管理 / 记忆 / 工具网关 / 技能管理 / 插件中心）。",
+    "en": "A collection of DeepSeek Harness plugins by sanqiuyef (MCP manager, memory, tool gateway, skill manager, plugin hub)."
+  },
+  "metadata": {
+    "categories": {
+      "mcp": {
+        "title": {
+          "zh": "MCP 与工具",
+          "en": "MCP & Tools"
+        }
+      },
+      "memory": {
+        "title": {
+          "zh": "记忆",
+          "en": "Memory"
+        }
+      },
+      "skills": {
+        "title": {
+          "zh": "技能",
+          "en": "Skills"
+        }
+      },
+      "market": {
+        "title": {
+          "zh": "插件生态",
+          "en": "Plugin Ecosystem"
+        }
+      }
+    }
+  },
+  "plugins": [
+    {
+      "name": "dsh-mcp-manager",
+      "title": {
+        "zh": "MCP 服务器管理",
+        "en": "MCP Server Manager"
+      },
+      "description": {
+        "zh": "在设置页管理 MCP 服务器：清单、启停、编辑、新增/删除（含手写行）、连接健康度、就地重连、探测阶段归因与导入导出。",
+        "en": "Manage MCP servers from Settings: list, enable/disable, edit, add/remove (including hand-written rows), connection health, in-place reconnect, probe diagnostics and import/export."
+      },
+      "author": "sanqiuyef",
+      "homepage": "https://github.com/sanqiuyef/SQY-DSH-PLUGIN",
+      "repository": {
+        "url": "https://github.com/sanqiuyef/SQY-DSH-PLUGIN",
+        "directory": "dsh-mcp-manager"
+      },
+      "metadata": {
+        "category": "mcp",
+        "keywords": [
+          "mcp",
+          "settings",
+          "gateway",
+          "probe",
+          "health"
+        ]
+      },
+      "dist-tags": {
+        "latest": "0.2.3"
+      },
+      "versions": [
+        {
+          "version": "0.2.3",
+          "publishTimestamp": 1793779469,
+          "source": {
+            "type": "git",
+            "url": "https://github.com/sanqiuyef/SQY-DSH-PLUGIN",
+            "commit": "059633f4f0decd65af3069a9981c5e495c6df82c",
+            "path": "dsh-mcp-manager"
+          },
+          "engines": {
+            "dsh": ">=0.2.1-rc.2"
+          }
+        }
+      ]
+    },
+    {
+      "name": "dsh-memory-manager",
+      "title": {
+        "zh": "记忆管理",
+        "en": "Memory Manager"
+      },
+      "description": {
+        "zh": "全局与项目级记忆：memory_* 工具、system prompt 摘要注入（时间倒序 + 近期带）、写去重提示、别名并条、写入脱敏与运行审计。",
+        "en": "Global and project-scoped memory: memory_* tools, system-prompt digest (newest-first + recency band), write de-duplication hints, aliases, write redaction and run audit."
+      },
+      "author": "sanqiuyef",
+      "homepage": "https://github.com/sanqiuyef/SQY-DSH-PLUGIN",
+      "repository": {
+        "url": "https://github.com/sanqiuyef/SQY-DSH-PLUGIN",
+        "directory": "dsh-memory-manager"
+      },
+      "metadata": {
+        "category": "memory",
+        "keywords": [
+          "memory",
+          "project-memory",
+          "global-memory",
+          "redaction",
+          "digest"
+        ]
+      },
+      "dist-tags": {
+        "latest": "0.3.0"
+      },
+      "versions": [
+        {
+          "version": "0.3.0",
+          "publishTimestamp": 1793779469,
+          "source": {
+            "type": "git",
+            "url": "https://github.com/sanqiuyef/SQY-DSH-PLUGIN",
+            "commit": "059633f4f0decd65af3069a9981c5e495c6df82c",
+            "path": "dsh-memory-manager"
+          },
+          "engines": {
+            "dsh": ">=0.2.1-rc.2"
+          }
+        }
+      ]
+    },
+    {
+      "name": "dsh-mcp-gateway",
+      "title": {
+        "zh": "MCP 工具网关",
+        "en": "MCP Tool Gateway"
+      },
+      "description": {
+        "zh": "MCP 工具渐进披露：mcp_catalog / mcp_search / mcp_describe 三个元工具，支持裸名与拼名解析、批量描述、参数名检索与 select: 精确取用；不隐藏原有工具。",
+        "en": "Progressive disclosure for MCP tools: mcp_catalog / mcp_search / mcp_describe meta-tools with bare and qualified name resolution, batch describe, parameter-name search and select: exact fetch; no existing tool is hidden."
+      },
+      "author": "sanqiuyef",
+      "homepage": "https://github.com/sanqiuyef/SQY-DSH-PLUGIN",
+      "repository": {
+        "url": "https://github.com/sanqiuyef/SQY-DSH-PLUGIN",
+        "directory": "dsh-mcp-gateway"
+      },
+      "metadata": {
+        "category": "mcp",
+        "keywords": [
+          "mcp",
+          "tool-search",
+          "progressive-disclosure",
+          "token-saving"
+        ]
+      },
+      "dist-tags": {
+        "latest": "0.2.0"
+      },
+      "versions": [
+        {
+          "version": "0.2.0",
+          "publishTimestamp": 1793779469,
+          "source": {
+            "type": "git",
+            "url": "https://github.com/sanqiuyef/SQY-DSH-PLUGIN",
+            "commit": "059633f4f0decd65af3069a9981c5e495c6df82c",
+            "path": "dsh-mcp-gateway"
+          },
+          "engines": {
+            "dsh": ">=0.2.1-rc.2"
+          }
+        }
+      ]
+    },
+    {
+      "name": "dsh-skill-manager",
+      "title": {
+        "zh": "技能管理",
+        "en": "Skill Manager"
+      },
+      "description": {
+        "zh": "设置页技能管理：根扫描、_disabled 启停、三态调用策略（软禁用）、批量操作、调用账本、本地技能包导入、安装来源账本与插件同名提示。",
+        "en": "Skill management in Settings: root scan, _disabled toggling, three-state invocation policy (soft disable), batch operations, usage ledger, local skill import, install provenance and plugin-duplicate hints."
+      },
+      "icon": "dsh-skill-manager/icon.svg",
+      "author": "sanqiuyef",
+      "homepage": "https://github.com/sanqiuyef/SQY-DSH-PLUGIN",
+      "repository": {
+        "url": "https://github.com/sanqiuyef/SQY-DSH-PLUGIN",
+        "directory": "dsh-skill-manager"
+      },
+      "metadata": {
+        "category": "skills",
+        "keywords": [
+          "skills",
+          "skill-manager",
+          "settings",
+          "import"
+        ]
+      },
+      "dist-tags": {
+        "latest": "0.1.7"
+      },
+      "versions": [
+        {
+          "version": "0.1.7",
+          "publishTimestamp": 1793779469,
+          "source": {
+            "type": "git",
+            "url": "https://github.com/sanqiuyef/SQY-DSH-PLUGIN",
+            "commit": "059633f4f0decd65af3069a9981c5e495c6df82c",
+            "path": "dsh-skill-manager"
+          },
+          "engines": {
+            "dsh": ">=0.2.1-rc.2"
+          }
+        }
+      ]
+    },
+    {
+      "name": "dsh-plugin-hub",
+      "title": {
+        "zh": "插件中心",
+        "en": "Plugin Hub"
+      },
+      "description": {
+        "zh": "插件市场与插件管理双标签：安装 ZCode 格式插件包并把 skills / commands / hooks / MCP 按 Agent 投影进会话；版本历史与回滚、故障诊断、项目信任门、MCP 重名冲突让位。",
+        "en": "Plugin market and manager in one panel: install ZCode-format plugin bundles and project their skills / commands / hooks / MCP into sessions; version history and rollback, diagnostics, project trust gate and MCP name-conflict yielding."
+      },
+      "icon": "dsh-plugin-hub/icon.svg",
+      "author": "sanqiuyef",
+      "homepage": "https://github.com/sanqiuyef/SQY-DSH-PLUGIN",
+      "repository": {
+        "url": "https://github.com/sanqiuyef/SQY-DSH-PLUGIN",
+        "directory": "dsh-plugin-hub"
+      },
+      "metadata": {
+        "category": "market",
+        "keywords": [
+          "plugins",
+          "marketplace",
+          "zcode-plugins",
+          "projection"
+        ]
+      },
+      "dist-tags": {
+        "latest": "0.3.1"
+      },
+      "versions": [
+        {
+          "version": "0.3.1",
+          "publishTimestamp": 1793779469,
+          "source": {
+            "type": "git",
+            "url": "https://github.com/sanqiuyef/SQY-DSH-PLUGIN",
+            "commit": "059633f4f0decd65af3069a9981c5e495c6df82c",
+            "path": "dsh-plugin-hub"
+          },
+          "engines": {
+            "dsh": ">=0.2.1-rc.2"
+          }
+        }
+      ]
+    }
+  ]
+}
