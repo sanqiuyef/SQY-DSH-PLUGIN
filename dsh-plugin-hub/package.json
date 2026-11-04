@@ -1,0 +1,63 @@
+{
+  "name": "dsh-plugin-hub",
+  "version": "0.3.1",
+  "description": "Plugin Hub for DeepSeek Harness — install ZCode-format plugins (skills, commands, hooks, MCP servers) and project them into sessions, with user and workspace scope. · DSH 插件中心",
+  "type": "module",
+  "main": "lib/index.js",
+  "license": "MIT",
+  "keywords": [
+    "dsh",
+    "deepseek-harness",
+    "plugin",
+    "plugins",
+    "marketplace",
+    "skills",
+    "mcp"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/sanqiuyef/dsh-plugin-hub.git"
+  },
+  "homepage": "https://github.com/sanqiuyef/dsh-plugin-hub#readme",
+  "bugs": {
+    "url": "https://github.com/sanqiuyef/dsh-plugin-hub/issues"
+  },
+  "engines": {
+    "node": ">=20",
+    "dsh": ">=0.2.1-rc.2"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "^4.0.1"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": [
+        "@deepseek-ai/dsh-client-locale",
+        "@deepseek-ai/dsh-client-ui-settings"
+      ]
+    }
+  },
+  "exports": {
+    ".": "./lib/index.js",
+    "./client": "./client/client.js",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib",
+    "client",
+    "locale",
+    "icon.svg",
+    "cordis.patch.yml",
+    "README.md",
+    "SPEC.md",
+    "package.json"
+  ]
+}

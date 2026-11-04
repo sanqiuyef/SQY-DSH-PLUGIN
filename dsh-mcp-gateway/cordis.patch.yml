@@ -1,0 +1,6 @@
+# dsh-mcp-gateway bundle patch
+#
+# 只插入本插件自己的一行宿主条目；不碰任何 MCP 服务器行。
+- insert:
+    - id: mcp-gateway
+      name: 'dsh-mcp-gateway'

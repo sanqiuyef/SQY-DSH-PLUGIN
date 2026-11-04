@@ -1,0 +1,53 @@
+{
+  "name": "dsh-mcp-manager",
+  "version": "0.2.3",
+  "description": "MCP server manager for DeepSeek Harness — global MCP servers (profile patch) and project-level MCP servers (project .dsh/mcp.json, trusted per project), from one Settings page or the sidebar panel. · DSH MCP 服务器管理面板",
+  "type": "module",
+  "main": "lib/index.js",
+  "license": "MIT",
+  "keywords": ["dsh", "deepseek-harness", "plugin", "mcp", "mcp-servers"],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/sanqiuyef/dsh-mcp-manager.git"
+  },
+  "homepage": "https://github.com/sanqiuyef/dsh-mcp-manager#readme",
+  "bugs": {
+    "url": "https://github.com/sanqiuyef/dsh-mcp-manager/issues"
+  },
+  "engines": {
+    "node": ">=20",
+    "dsh": ">=0.2.1-rc.2"
+  },
+  "dependencies": {
+    "yaml": "^2.8.1"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "^4.0.1"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": [
+        "@deepseek-ai/dsh-client-locale",
+        "@deepseek-ai/dsh-client-ui-settings"
+      ]
+    }
+  },
+  "exports": {
+    ".": "./lib/index.js",
+    "./client": "./client/client.js",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib",
+    "client",
+    "cordis.patch.yml",
+    "README.md",
+    "package.json"
+  ]
+}

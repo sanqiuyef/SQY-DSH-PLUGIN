@@ -1,0 +1,6 @@
+# dsh-memory-manager bundle patch
+#
+# 只插入本插件自己的一行宿主条目；记忆数据在文件系统（Markdown），不在 profile 补丁里。
+- insert:
+    - id: memory-manager
+      name: 'dsh-memory-manager'

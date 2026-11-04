@@ -1,0 +1,63 @@
+{
+  "name": "dsh-skill-manager",
+  "version": "0.1.7",
+  "description": "Skill manager for DeepSeek Harness — a ZCode-style settings page and a sidebar panel that list the skills on disk (project / user / custom / bundled), enable or disable them, edit SKILL.md inline with host-accurate lint, and install skills from the local market clone. · DSH 技能管理",
+  "type": "module",
+  "main": "lib/index.js",
+  "license": "MIT",
+  "keywords": [
+    "dsh",
+    "deepseek-harness",
+    "plugin",
+    "skills",
+    "skill-manager"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/sanqiuyef/dsh-skill-manager.git"
+  },
+  "homepage": "https://github.com/sanqiuyef/dsh-skill-manager#readme",
+  "bugs": {
+    "url": "https://github.com/sanqiuyef/dsh-skill-manager/issues"
+  },
+  "engines": {
+    "node": ">=20",
+    "dsh": ">=0.2.1-rc.2"
+  },
+  "dependencies": {
+    "yaml": "^2.8.1"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "^4.0.1"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": [
+        "@deepseek-ai/dsh-client-locale",
+        "@deepseek-ai/dsh-client-ui-settings"
+      ]
+    }
+  },
+  "exports": {
+    ".": "./lib/index.js",
+    "./client": "./client/client.js",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg"
+  },
+  "files": [
+    "lib",
+    "client",
+    "locale",
+    "icon.svg",
+    "README.md",
+    "cordis.patch.yml",
+    "package.json"
+  ]
+}

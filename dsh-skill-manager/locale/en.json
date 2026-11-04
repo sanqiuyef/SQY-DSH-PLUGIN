@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Skill Manager",
+    "description": "Lists the skills on disk (project / user / custom / bundled), enables or disables them, edits SKILL.md inline with the same lint the host applies, and installs skills from the local market clone. Reachable from Settings → Skills and from the sidebar quick entry under Automation tasks."
+  }
+}

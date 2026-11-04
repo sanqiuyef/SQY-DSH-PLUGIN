@@ -1,0 +1,59 @@
+{
+  "name": "dsh-memory-manager",
+  "version": "0.3.0",
+  "description": "Memory manager for DeepSeek Harness — global and project-scoped markdown memories: memory_* tools, recency-first system-prompt digest, write-time dedupe hints and secret masking, a bounded runtime audit, and a Settings page. · DSH 记忆管理（全局 + 项目级）",
+  "type": "module",
+  "main": "lib/index.js",
+  "license": "MIT",
+  "keywords": [
+    "dsh",
+    "deepseek-harness",
+    "plugin",
+    "memory",
+    "agent-memory"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/sanqiuyef/dsh-memory-manager.git"
+  },
+  "homepage": "https://github.com/sanqiuyef/dsh-memory-manager#readme",
+  "bugs": {
+    "url": "https://github.com/sanqiuyef/dsh-memory-manager/issues"
+  },
+  "engines": {
+    "node": ">=20",
+    "dsh": ">=0.2.1-rc.2"
+  },
+  "dependencies": {
+    "yaml": "^2.8.1"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "^4.0.1"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": [
+        "@deepseek-ai/dsh-client-locale",
+        "@deepseek-ai/dsh-client-ui-settings"
+      ]
+    }
+  },
+  "exports": {
+    ".": "./lib/index.js",
+    "./client": "./client/client.js",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib",
+    "client",
+    "cordis.patch.yml",
+    "README.md",
+    "package.json"
+  ]
+}

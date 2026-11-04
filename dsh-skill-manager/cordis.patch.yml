@@ -1,0 +1,7 @@
+# dsh-skill-manager bundle patch
+#
+# 只插入本插件自己的一行宿主条目；技能数据始终在磁盘（各技能根），
+# 不进 profile 补丁，也不改写其它插件的行。
+- insert:
+    - id: skill-manager
+      name: 'dsh-skill-manager'

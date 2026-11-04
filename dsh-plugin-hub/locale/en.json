@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Plugin Hub",
+    "description": "A ZCode-style plugin center: add marketplaces, browse and install plugins, then enable, configure and remove them. Skills, commands, hooks and MCP servers are projected into sessions."
+  }
+}

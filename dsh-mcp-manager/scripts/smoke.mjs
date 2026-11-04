@@ -1,0 +1,2194 @@
+/**
+ * dsh-mcp-manager host-half smoke test — offline, no host, no plugin install.
+ *
+ * The host half's risky logic is almost entirely pure: rendering YAML the loader will
+ * accept, splicing exactly one managed region, deriving a raw-layer edit from an
+ * `inherited` base, mapping foreign `mcpServers` shapes, framing JSON-RPC on a stream.
+ * This file exercises all of it with fakes, so a defect shows up here instead of in
+ * the desktop profile.
+ *
+ * What is asserted, in order:
+ *   A. YAML round-trip        — quoting, backslashes, `!!js` preservation, block shape
+ *   B. managed-block splicing — created/replaced/removed, outside bytes untouched,
+ *                               top-level override cleanup, sentinel refusal
+ *   C. file plumbing          — lock, atomic write, backup, parse errors
+ *   D. validation             — serverName, transports, env value forms, effective config
+ *   E. import/export mapping  — transport aliases, sse substitution, `$env:` forms,
+ *                               dropped fields, no literal credential in an export
+ *   F. probe wire protocol    — frame assembly, request/response correlation,
+ *                               malformed-line tolerance, abort timeout
+ *   G. list view              — joins live inventory + raw layers + tool namespaces,
+ *                               `source`, no evaluated value in the response
+ *   H. toggle                 — application outcomes and failure classification
+ *   I. update                 — inherited base (never evaluated), `{__keep}`, migration
+ *   J. add/remove end to end  — real file writes in a temp profile, compose simulation,
+ *                               rollback when the host never composes the row
+ *   J2. hand-written removal  — byte-exact node-range surgery, emptied insert lists,
+ *                               non-MCP / orphan / flow-style / broken-patch refusals,
+ *                               rollback when the entry survives
+ *   K. security/HTTP helpers  — rejection gate, method, content type, body cap, redaction
+ *   L. diagnostics            — duplicate/invalid names, missing command/env, literal secret
+ *   M. the real profile       — read-only dry run (skipped when unreachable)
+ *   N. route wiring           — the eight contract routes end to end
+ *   O. startup snapshot       — written, bounded, credential-free, path exposed
+ *   P. env bridge             — secrets.json → process.env; never a value in a response
+ *   Q. unified trust/priority — contract §1 aggregate hash vectors, canonical read/write,
+ *                               legacy fallback, and project servers skipped on a global name
+ *                               collision (contract §2) with a fake ctx + pluginManager
+ *
+ * Run:  node scripts/smoke.mjs
+ */
+
+import { createHash } from 'node:crypto';
+import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
+import { existsSync } from 'node:fs';
+import { homedir, tmpdir } from 'node:os';
+import { join } from 'node:path';
+
+import {
+  MANAGED_BEGIN,
+  MANAGED_END,
+  MCP_CLIENT_PACKAGE,
+  addManagedServer,
+  backupPatchText,
+  inspectPatch,
+  managedSpan,
+  parsePatch,
+  patchIdFor,
+  planAdd,
+  planRemove,
+  readManagedRows,
+  readPatchText,
+  removeManagedServer,
+  removeTopLevelRowsById,
+  renderManagedBlock,
+  renderServerRow,
+  writePatchText,
+  withPatchLock,
+} from '../lib/patch.js';
+import {
+  ApiError,
+  rejectUnauthorized,
+  requireJson,
+  requireMethod,
+  sendError,
+  sendJson,
+  readJsonBody,
+  redact,
+} from '../lib/security.js';
+import {
+  SERVER_NAME_PATTERN,
+  diagnose,
+  isSecretName,
+  validateConfigPatch,
+  validateEffectiveConfig,
+  validateServerInput,
+} from '../lib/diagnostics.js';
+import {
+  SCHEMA_MAX_BYTES,
+  clearProbes,
+  createProbeChannel,
+  hintFor,
+  lastProbeOf,
+  normalizeTools,
+  parseMcpHttpBody,
+  probeFrames,
+  probeTargetFingerprint,
+  rememberProbe,
+  resolveExpressionMap,
+  scrubEnv,
+} from '../lib/probe.js';
+import { healthEntryCount, healthOf, pruneHealth, resetHealth } from '../lib/health.js';
+import { reconnectGlobalServer } from '../lib/reconnect.js';
+import {
+  exportDefinition,
+  importServers,
+  importValue,
+  serverFromImportDefinition,
+} from '../lib/transfer.js';
+import { assertKeepResolved, migrateSecretLiterals, resolveKeepSentinels, sanitizeMerged, updateServerConfig } from '../lib/edit.js';
+import { setServerEnabled } from '../lib/toggle.js';
+import { listServers } from '../lib/servers.js';
+import { apply, inject as injectedServices, name as pluginName } from '../lib/index.js';
+import { captureSnapshot, lastSnapshotPath, scheduleSnapshot } from '../lib/snapshot.js';
+import { applyEnvBridge, envBridgeSnapshot, resetEnvBridge } from '../lib/env-bridge.js';
+import {
+  hashBytes,
+  isProjectTrusted,
+  readTrust,
+  revokeProject,
+  trustProject,
+} from '../lib/project.js';
+import {
+  approveProject,
+  aggregateHash,
+  canonicalTrustText,
+  normalizeTrustKey,
+  trustLockPathFor,
+  trustStateFor,
+  trustStorePathFor,
+} from '../lib/project-trust.js';
+import { globalMcpOccupancy, isShadowedByGlobal } from '../lib/global-mcp.js';
+import { mountProjectRuntime, projectRuntimeSnapshot, remountProjectServer, resetProjectRuntime } from '../lib/project-runtime.js';
+import { projectView, trustProjectScope } from '../lib/project-api.js';
+
+let failures = 0;
+const check = (label, condition, detail = '') => {
+  const ok = Boolean(condition);
+  if (!ok) failures += 1;
+  console.log(`${ok ? 'PASS' : 'FAIL'}  ${label}${detail ? `  ${detail}` : ''}`);
+};
+
+const section = (title) => console.log(`\n--- ${title} ---`);
+
+/** Parse a patch document with the loader's `!!js` tag and return its data. */
+const patchData = (text) => parsePatch(text).toJS();
+
+const mockResponse = () => ({
+  statusCode: 0,
+  headers: {},
+  body: '',
+  ended: false,
+  writeHead(status, headers) {
+    this.statusCode = status;
+    this.headers = headers ?? {};
+    return this;
+  },
+  end(body) {
+    if (body !== undefined) this.body += String(body);
+    this.ended = true;
+  },
+});
+
+const sampleServer = (overrides = {}) => ({
+  serverName: 'demo',
+  transport: 'stdio',
+  command: 'C:\\Python311\\python.exe',
+  args: ['-X', 'utf8', '-m', 'demo_server'],
+  cwd: 'D:\\work\\demo',
+  env: {
+    KMP_DUPLICATE_LIB_OK: 'TRUE',
+    LANCEDB_OCR: '1',
+    API_KEY: { __jsExpr: 'process.env.DEMO_API_KEY' },
+  },
+  ...overrides,
+});
+
+const main = async () => {
+  // ------------------------------------------------------------------ A. rendering
+  section('A. YAML rendering round-trip');
+  {
+    const server = sampleServer({ toolCallTimeoutMs: 60000, failOnStartupError: true });
+    const rowText = renderServerRow(server);
+    const block = renderManagedBlock([rowText]);
+    check('the block starts with the begin sentinel', block.startsWith(MANAGED_BEGIN));
+    check('the block ends with the end sentinel', block.trimEnd().endsWith(MANAGED_END));
+
+    const data = patchData(block);
+    check('the block is a top-level array with one patch row', Array.isArray(data) && data.length === 1, `len=${data?.length}`);
+    const rows = data?.[0]?.insert ?? [];
+    check('the patch row is an insert list', Array.isArray(rows));
+    check('one server becomes one row', rows.length === 1, `rows=${rows.length}`);
+    const row = rows[0] ?? {};
+    check('the row id is derived from serverName', row.id === 'mcp-client-demo', String(row.id));
+    check('the row names the mcp-client package', row.name === MCP_CLIENT_PACKAGE);
+    check('the transport survives', row.config?.transport === 'stdio');
+    check('the serverName survives', row.config?.serverName === 'demo');
+    check('windows paths keep their backslashes', row.config?.command === 'C:\\Python311\\python.exe', String(row.config?.command));
+    check('args keep their order and count', JSON.stringify(row.config?.args) === JSON.stringify(['-X', 'utf8', '-m', 'demo_server']));
+    check('cwd survives', row.config?.cwd === 'D:\\work\\demo');
+    check('a value that looks like a boolean stays a string', row.config?.env?.KMP_DUPLICATE_LIB_OK === 'TRUE', JSON.stringify(row.config?.env?.KMP_DUPLICATE_LIB_OK));
+    check('a numeric-looking value stays a string', row.config?.env?.LANCEDB_OCR === '1', JSON.stringify(row.config?.env?.LANCEDB_OCR));
+    check('a credential is emitted as an unevaluated !!js expression', row.config?.env?.API_KEY?.__jsExpr === 'process.env.DEMO_API_KEY', JSON.stringify(row.config?.env?.API_KEY));
+    check('toolCallTimeoutMs is a number', row.config?.toolCallTimeoutMs === 60000);
+    check('failOnStartupError is a boolean', row.config?.failOnStartupError === true);
+    check('an empty block is a valid empty insert list', JSON.stringify(patchData(renderManagedBlock([]))) === JSON.stringify([{ insert: [] }]));
+
+    const httpRow = renderServerRow({
+      serverName: 'remote',
+      transport: 'streamable-http',
+      url: 'https://example.test/mcp',
+      headers: { Authorization: { __jsExpr: 'process.env.REMOTE_TOKEN' } },
+    });
+    const httpData = patchData(renderManagedBlock([httpRow]));
+    const httpConfig = httpData[0].insert[0].config;
+    check('an http row carries its url', httpConfig.url === 'https://example.test/mcp');
+    check('an http header can be an expression', httpConfig.headers?.Authorization?.__jsExpr === 'process.env.REMOTE_TOKEN');
+    check('an http row carries no stdio keys', httpConfig.command === undefined && httpConfig.env === undefined);
+  }
+
+  // ----------------------------------------------------------- B. block splicing
+  section('B. managed-block splicing');
+  {
+    const base = [
+      '# profile patch (stand-in)',
+      '- id: ui-theme',
+      '  name: "@deepseek-ai/dsh-client-ui-theme"',
+      '  config:',
+      '    preference: light',
+      '- insert:',
+      '    - id: mcp-client-handwritten',
+      '      name: \'@deepseek-ai/dsh-mcp-client\'',
+      '      config:',
+      '        transport: stdio',
+      '        serverName: \'handwritten\'',
+      '        command: \'D:\\bin\\hand.exe\'',
+      '',
+    ].join('\n');
+
+    const created = planAdd(base, sampleServer());
+    check('a first add creates the managed block', created.mode === 'created' && created.next.includes(MANAGED_BEGIN));
+    check('an add appends without touching the original bytes', created.next.startsWith(base));
+    check('the document still parses', inspectPatch(created.next).ok);
+
+    const found = inspectPatch(created.next).rows;
+    const handwritten = found.find((row) => row.patchId === 'mcp-client-handwritten');
+    const managed = found.find((row) => row.patchId === 'mcp-client-demo');
+    check('the hand-written row is reported outside the managed block', handwritten?.managed === false);
+    check('the new row is reported inside the managed block', managed?.managed === true);
+    check('only the new row is managed', inspectPatch(created.next).managedIds.length === 1);
+
+    const second = planAdd(created.next, sampleServer({ serverName: 'second' }));
+    const createdPrefix = created.next.slice(0, created.next.indexOf(MANAGED_BEGIN));
+    const createdSuffix = created.next.slice(created.next.indexOf(MANAGED_END) + MANAGED_END.length);
+    check('a later add replaces just the managed block', second.mode === 'replaced');
+    check('the prefix before the block is byte-identical', second.next.slice(0, second.next.indexOf(MANAGED_BEGIN)) === createdPrefix);
+    check('the suffix after the block is byte-identical', second.next.endsWith(createdSuffix));
+
+    const removed = planRemove(second.next, patchIdFor('demo'));
+    check('a removal changes the document', removed.changed === true);
+    check('the removed row is gone', !removed.next.includes('mcp-client-demo'));
+    check('the sibling managed row survives', removed.next.includes('mcp-client-second'));
+    check('the hand-written row survives', removed.next.includes('mcp-client-handwritten'));
+    check('removal keeps the prefix byte-identical', removed.next.slice(0, removed.next.indexOf(MANAGED_BEGIN)) === createdPrefix);
+    check('after removal the document still parses', inspectPatch(removed.next).ok);
+
+    let notManageable = 'no-error';
+    try {
+      planRemove(created.next, 'mcp-client-handwritten');
+    } catch (error) {
+      notManageable = `${error.code}: ${error.message}`;
+    }
+    check('deleting a hand-written row is refused as not-manageable', notManageable.startsWith('not-manageable'), notManageable);
+
+    // Top-level override rows for the same id are removed with it (contract §6.2).
+    const withOverride = `${second.next}
+- id: mcp-client-demo
+  disabled: true
+- id: plugin-market
+  config:
+    indexes: []
+`;
+    const cleaned = planRemove(withOverride, patchIdFor('demo'));
+    check('the same-id top-level override row is cleaned up', !/^- id: mcp-client-demo$/m.test(cleaned.next), cleaned.removedOverrides);
+    check('an unrelated top-level row is untouched', cleaned.next.includes('- id: plugin-market'));
+
+    const lines = '- id: keep-a\n  disabled: false\n- id: drop-me\n  disabled: true\n- id: keep-b\n  disabled: false\n';
+    const stripped = removeTopLevelRowsById(lines, 'drop-me');
+    check('targeted top-level removal removes one row', stripped.removed === 1);
+    check('targeted top-level removal keeps the others', stripped.text === '- id: keep-a\n  disabled: false\n- id: keep-b\n  disabled: false\n', JSON.stringify(stripped.text));
+
+    let halfBlock = 'no-error';
+    try {
+      planAdd(`${MANAGED_BEGIN}\n- insert: []\n`, sampleServer());
+    } catch (error) {
+      halfBlock = `${error.code}: ${error.message}`;
+    }
+    check('a begin marker without an end marker is refused', halfBlock.startsWith('patch-invalid'), halfBlock);
+
+    let strayEnd = 'no-error';
+    try {
+      managedSpan(`${MANAGED_END}\n`);
+    } catch (error) {
+      strayEnd = `${error.code}: ${error.message}`;
+    }
+    check('an end marker without a begin marker is refused', strayEnd.startsWith('patch-invalid'), strayEnd);
+
+    let brokenYaml = 'no-error';
+    try {
+      planAdd('- id: [unclosed\n', sampleServer());
+    } catch (error) {
+      brokenYaml = `${error.code}: ${error.message}`;
+    }
+    check('adding to a document that does not parse is refused', brokenYaml.startsWith('patch-invalid'), brokenYaml);
+    check('managed row ids are readable from text', JSON.stringify(readManagedRows(second.next).rows.map((row) => row.id)) === JSON.stringify(['mcp-client-demo', 'mcp-client-second']));
+  }
+
+  // -------------------------------------------------------------- C. file plumbing
+  section('C. lock / atomic write / backup');
+  {
+    const dir = await mkdtemp(join(tmpdir(), 'mcp-manager-files-'));
+    try {
+      const path = join(dir, 'cordis.patch.yml');
+      check('a missing patch file reads as empty text', (await readPatchText(path)) === '');
+      await writePatchText(path, 'hello\n');
+      check('a write is readable back', (await readPatchText(path)) === 'hello\n');
+      await writePatchText(path, 'hello again\n');
+      check('a second atomic write replaces the content', (await readPatchText(path)) === 'hello again\n');
+
+      let ran = false;
+      await withPatchLock(dir, async () => {
+        ran = true;
+      });
+      check('the profile lock runs the operation', ran);
+      check('the lock file is removed afterwards', !existsSync(join(dir, 'package.json.lock')));
+
+      const backup = await backupPatchText(path, 'hello again\n');
+      check('a backup is written under data/mcp-manager', backup.includes(join('data', 'mcp-manager')) && backup.includes('backup-'));
+      check('the backup holds the pre-write text', (await readFile(backup, 'utf8')) === 'hello again\n');
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  }
+
+  // ---------------------------------------------------------------- D. validation
+  section('D. input validation');
+  {
+    check('the serverName pattern matches the host rule', SERVER_NAME_PATTERN.test('a-b_1') && !SERVER_NAME_PATTERN.test('has space') && !SERVER_NAME_PATTERN.test('x'.repeat(33)));
+
+    const good = validateServerInput({ serverName: 'alpha', transport: 'stdio', command: 'python', args: ['-m', 'x'], env: { A: '1', B: { __jsExpr: 'process.env.B' } } });
+    check('a valid stdio definition is accepted', good.ok === true, JSON.stringify(good.errors));
+    check('an expression env value is preserved raw', good.server?.env?.B?.__jsExpr === 'process.env.B');
+
+    const badName = validateServerInput({ serverName: 'bad name', command: 'x' });
+    check('an illegal serverName is rejected', badName.ok === false && badName.errors.some((entry) => entry.field === 'serverName'));
+    const noCommand = validateServerInput({ serverName: 'alpha', transport: 'stdio' });
+    check('stdio without a command is rejected', noCommand.ok === false && noCommand.errors.some((entry) => entry.field === 'command'));
+    const badUrl = validateServerInput({ serverName: 'alpha', transport: 'streamable-http', url: 'not a url' });
+    check('an http row without a valid url is rejected', badUrl.ok === false && badUrl.errors.some((entry) => entry.field === 'url'));
+    const goodHttp = validateServerInput({ serverName: 'alpha', transport: 'streamable-http', url: 'https://x.test/mcp' });
+    check('a valid http definition is accepted', goodHttp.ok === true);
+    const badEnv = validateServerInput({ serverName: 'alpha', command: 'x', env: { K: 5 } });
+    check('a non-string env value is rejected', badEnv.ok === false && badEnv.errors.some((entry) => entry.field === 'env.K'));
+    const badArgs = validateServerInput({ serverName: 'alpha', command: 'x', args: 'not-an-array' });
+    check('a non-array args is rejected', badArgs.ok === false && badArgs.errors.some((entry) => entry.field === 'args'));
+    const wrongId = validateServerInput({ serverName: 'alpha', command: 'x', id: 'custom-id' });
+    check('an id that is not the derived patch id is rejected', wrongId.ok === false && wrongId.errors.some((entry) => entry.field === 'id'));
+    const rightId = validateServerInput({ serverName: 'alpha', command: 'x', id: 'mcp-client-alpha' });
+    check('the derived patch id is accepted', rightId.ok === true);
+
+    const partial = validateConfigPatch({ toolCallTimeoutMs: 1234, unknown_field: 'ignored' });
+    check('a partial config patch validates', partial.ok === true && partial.config?.toolCallTimeoutMs === 1234);
+    const badTimeout = validateConfigPatch({ toolCallTimeoutMs: -1 });
+    check('a non-positive timeout is rejected', badTimeout.ok === false);
+
+    const mergedNoCommand = validateEffectiveConfig({ transport: 'stdio', serverName: 'alpha' });
+    check('an effective config missing its command is rejected', mergedNoCommand.ok === false);
+    const mergedHttp = validateEffectiveConfig({ transport: 'streamable-http', serverName: 'alpha', url: 'https://x.test' });
+    check('a valid effective http config passes', mergedHttp.ok === true);
+  }
+
+  // ------------------------------------------------------- E. import / export map
+  section('E. import/export mapping');
+  {
+    check('an expression exports as an !!js string', exportDefinition({ transport: 'stdio', command: 'x', env: { TOKEN: { __jsExpr: 'process.env.T' } } }).env?.TOKEN === '!!js process.env.T');
+    check('a literal non-secret env value exports as-is', exportDefinition({ transport: 'stdio', command: 'x', env: { FLAG: '1' } }).env?.FLAG === '1');
+    const secretExport = exportDefinition({ transport: 'stdio', command: 'x', env: { GITHUB_PERSONAL_ACCESS_TOKEN: 'ghp_literalvalue' } });
+    check('a literal credential is never exported', secretExport.env?.GITHUB_PERSONAL_ACCESS_TOKEN === undefined, JSON.stringify(secretExport.env));
+    const headerExport = exportDefinition({ transport: 'streamable-http', url: 'https://x.test', headers: { Authorization: 'Bearer abc', 'X-Trace': 'yes' } });
+    check('a literal Authorization header is never exported', headerExport.headers?.Authorization === undefined);
+    check('a non-secret header is exported', headerExport.headers?.['X-Trace'] === 'yes');
+    check('the http export uses type "http"', headerExport.type === 'http');
+
+    check('the ${VAR} form becomes an env expression', importValue('${DEMO_KEY}')?.__jsExpr === 'process.env.DEMO_KEY');
+    check('the ${process.env.X} form is kept verbatim', importValue('${process.env.DEMO_KEY}')?.__jsExpr === 'process.env.DEMO_KEY');
+    check('the $env: form becomes an env expression', importValue('$env:DEMO_KEY')?.__jsExpr === 'process.env.DEMO_KEY');
+    check('the !!js form is kept verbatim', importValue('!!js myExpr()')?.__jsExpr === 'myExpr()');
+    check('a plain string stays a literal', importValue('plain') === 'plain');
+
+    const aliases = ['streamableHttp', 'http', 'remote', 'streamable-http'];
+    check('every http alias maps to streamable-http', aliases.every((type) => serverFromImportDefinition('s', { type, url: 'https://x.test' }).server?.transport === 'streamable-http'));
+    const sse = serverFromImportDefinition('s', { type: 'sse', url: 'https://x.test' });
+    check('sse maps to streamable-http and is reported', sse.server?.transport === 'streamable-http' && sse.dropped.includes('transport:sse→streamable-http'), JSON.stringify(sse.dropped));
+    check('missing type + command is stdio', serverFromImportDefinition('s', { command: 'x' }).server?.transport === 'stdio');
+    check('missing type + url is streamable-http', serverFromImportDefinition('s', { url: 'https://x.test' }).server?.transport === 'streamable-http');
+    const dropped = serverFromImportDefinition('s', { command: 'x', autoApprove: ['*'], timeout: 30, disabled: false });
+    check('unsupported fields are reported, not silently dropped', JSON.stringify(dropped.dropped) === JSON.stringify(['autoApprove', 'timeout', 'disabled']), JSON.stringify(dropped.dropped));
+    const unknownType = serverFromImportDefinition('s', { type: 'websocket', url: 'ws://x' });
+    check('an unknown transport is an error', unknownType.ok === false && unknownType.errors.length > 0);
+  }
+
+  // --------------------------------------------------------------- F. probe wire
+  section('F. probe framing');
+  {
+    const frames = probeFrames();
+    check('initialize is id 1 with the 2025-06-18 revision', frames.initialize.id === 1 && frames.initialize.method === 'initialize' && frames.initialize.params.protocolVersion === '2025-06-18');
+    check('initialized is a notification', frames.initialized.method === 'notifications/initialized' && frames.initialized.id === undefined);
+    check('tools/list is id 2', frames.toolsList.id === 2 && frames.toolsList.method === 'tools/list');
+
+    const written = [];
+    const channel = createProbeChannel({ write: (line) => written.push(JSON.parse(line.trim())) });
+    const pending = channel.request(frames.initialize);
+    channel.push('{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-06-18","serverInfo":{"name":"fake"}}}\n');
+    const init = await pending;
+    check('a response frame resolves the matching request', init.result?.serverInfo?.name === 'fake');
+    check('the request was written as one newline-delimited line', written.length === 1 && written[0].id === 1);
+    channel.notify(frames.initialized);
+    check('a notification is written without an id', written[1].method === 'notifications/initialized' && written[1].id === undefined);
+
+    const second = channel.request(frames.toolsList);
+    channel.push('this line is not json\n');
+    channel.push('{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"one","description":"d"},{"name":"two"},{"bogus":true}]}}\n');
+    const listed = await second;
+    check('a malformed line is ignored, not fatal', normalizeTools(listed.result.tools).length === 2, JSON.stringify(normalizeTools(listed.result.tools)));
+    check('tool entries are reduced to name/description', normalizeTools(listed.result.tools)[0].name === 'one' && normalizeTools(listed.result.tools)[1].description === '');
+
+    const controller = new AbortController();
+    const aborting = createProbeChannel({ write: () => {}, signal: controller.signal, timeoutMs: 8000 });
+    const pendingAbort = aborting.request(frames.toolsList);
+    controller.abort();
+    let abortMessage = '';
+    try {
+      await pendingAbort;
+    } catch (error) {
+      abortMessage = error.message;
+    }
+    check('an abort rejects the pending request as a timeout', abortMessage.includes('timed out after 8000 ms'), abortMessage);
+
+    const errorChannel = createProbeChannel({ write: () => {} });
+    const failing = errorChannel.request(frames.initialize);
+    errorChannel.push('{"jsonrpc":"2.0","id":1,"error":{"code":-32602,"message":"bad params"}}\n');
+    let errorMessage = '';
+    try {
+      await failing;
+    } catch (error) {
+      errorMessage = error.message;
+    }
+    check('a JSON-RPC error response rejects with its message', errorMessage.includes('bad params'), errorMessage);
+
+    check('the scrub drops credential-shaped and DSH_ names', scrubEnv({ PATH: '/bin', GITHUB_TOKEN: 'x', DSH_PROFILE: 'desktop', HOME: '/h' }) && JSON.stringify(Object.keys(scrubEnv({ PATH: '/bin', GITHUB_TOKEN: 'x', DSH_PROFILE: 'desktop', HOME: '/h' }))) === JSON.stringify(['PATH', 'HOME']));
+    const resolved = resolveExpressionMap({ A: { __jsExpr: 'process.env.PATH' }, B: { __jsExpr: 'someFunction()' }, C: 'literal' });
+    check('process.env references resolve for the probe child', typeof resolved.values.A === 'string' && resolved.values.A.length > 0);
+    check('an arbitrary expression is skipped, not evaluated', resolved.skipped.includes('B') === true && resolved.values.B === undefined);
+    check('a literal passes through', resolved.values.C === 'literal');
+
+    check('a plain JSON body parses', parseMcpHttpBody('{"result":{"a":1}}', 'application/json')?.result?.a === 1);
+    const sse = 'event: message\ndata: {"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-06-18"}}\n\n';
+    check('an SSE body parses to its last data payload', parseMcpHttpBody(sse, 'text/event-stream')?.result?.protocolVersion === '2025-06-18');
+  }
+
+  // -------------------------------------------------------------- G. list view
+  section('G. list view joins live + raw + tools');
+  {
+    const dir = await mkdtemp(join(tmpdir(), 'mcp-manager-list-'));
+    try {
+      const patchPath = join(dir, 'cordis.patch.yml');
+      const alphaRow = renderServerRow({
+        serverName: 'alpha',
+        transport: 'stdio',
+        command: 'python',
+        env: {
+          GITHUB_PERSONAL_ACCESS_TOKEN: 'ghp_literalvalue1234567890',
+          SAFE_FLAG: '1',
+          DEMO_KEY: { __jsExpr: 'process.env.DEMO_KEY' },
+        },
+        toolCallTimeoutMs: 60000,
+      });
+      const betaRow = renderServerRow({ serverName: 'beta', transport: 'stdio', command: 'node' });
+      const document = `${renderManagedBlock([alphaRow])}\n- insert:\n${betaRow}\n- id: plugin-market\n  config:\n    indexes: []\n`;
+      await writeFile(patchPath, document, 'utf8');
+
+      const entryAlpha = {
+        id: 'include:mcp-client-alpha',
+        options: {
+          id: 'mcp-client-alpha',
+          name: MCP_CLIENT_PACKAGE,
+          // The evaluated config: a secret in plaintext. It must never reach the response.
+          config: { transport: 'stdio', serverName: 'alpha', env: { GITHUB_PERSONAL_ACCESS_TOKEN: 'ghp_literalvalue1234567890' } },
+        },
+      };
+      const rawAlpha = {
+        transport: 'stdio',
+        serverName: 'alpha',
+        command: 'python',
+        env: {
+          GITHUB_PERSONAL_ACCESS_TOKEN: 'ghp_literalvalue1234567890',
+          SAFE_FLAG: '1',
+          DEMO_KEY: { __jsExpr: 'process.env.DEMO_KEY' },
+        },
+        toolCallTimeoutMs: 60000,
+      };
+      const ctx = {
+        configEditor: {
+          documentPath: patchPath,
+          entries: () => [entryAlpha],
+          configuration: () => [{ entry: entryAlpha, inherited: rawAlpha, override: {} }],
+        },
+        pluginManager: {
+          listPlugins: async () => [
+            { entryId: entryAlpha.id, patchId: 'mcp-client-alpha', moduleName: MCP_CLIENT_PACKAGE, enabled: true, fiberPhase: 'active' },
+          ],
+        },
+        tools: {
+          schemas: () => [{ name: 'mcp__alpha__one' }, { name: 'mcp__alpha__two' }, { name: 'other_tool' }],
+        },
+      };
+
+      rememberProbe('alpha', { ok: true, durationMs: 12, tools: [{ name: 'one', description: '' }] });
+      const view = await listServers(ctx);
+      const alpha = view.servers.find((row) => row.serverName === 'alpha');
+      const beta = view.servers.find((row) => row.serverName === 'beta');
+
+      check('the live row is listed', alpha !== undefined);
+      check('the patch-only row is listed too', beta !== undefined);
+      check('the managed row is source=managed', alpha?.source === 'managed');
+      check('the hand-written row is source=handwritten', beta?.source === 'handwritten');
+      check('the live enablement is reported', alpha?.enabled === true);
+      check('the fiber phase is reported', alpha?.fiberPhase === 'active');
+      check(
+        'an active row with tools reports health connected',
+        alpha?.health?.state === 'connected' && typeof alpha?.health?.since === 'string',
+        JSON.stringify(alpha?.health),
+      );
+      check('a row with no live entry reports health stopped', beta?.health?.state === 'stopped', JSON.stringify(beta?.health));
+      check('the row says whether the tool count is known', alpha?.toolCountKnown === true && beta?.toolCountKnown === true);
+
+      // 宿主没给出工具注册表时，不能把「不知道」当成「0 个工具」进而误报连接失败。
+      const blindView = await listServers({
+        ...ctx,
+        tools: {
+          schemas() {
+            throw new Error('the service was renamed');
+          },
+        },
+      });
+      const blindAlpha = blindView.servers.find((row) => row.serverName === 'alpha');
+      check(
+        'a throwing tool registry is reported and keeps the row non-failing',
+        blindView.problems.some((problem) => problem.level === 'warn' && problem.message.includes('ctx.tools.schemas()')) &&
+          blindAlpha?.toolCountKnown === false &&
+          blindAlpha?.health?.state === 'connecting' &&
+          blindAlpha?.health?.reason === 'registry-unavailable',
+        JSON.stringify({ health: blindAlpha?.health, problems: blindView.problems.map((p) => p.message) }),
+      );
+      check('the tool count comes from the namespace', alpha?.toolCount === 2, String(alpha?.toolCount));
+      check('the patch-only row has no tool namespace', beta?.toolCount === 0);
+      check('env keys are names with expression flags', alpha?.envKeys.find((entry) => entry.key === 'DEMO_KEY')?.isJsExpr === true);
+      check('a literal env key is reported as not an expression', alpha?.envKeys.find((entry) => entry.key === 'SAFE_FLAG')?.isJsExpr === false);
+      check('envKeys carry no value field', alpha?.envKeys.every((entry) => Object.keys(entry).sort().join(',') === 'isJsExpr,jsExpr,key'));
+      check('lastProbe is attached from the cache', alpha?.lastProbe?.toolCount === 1 && alpha?.lastProbe?.ok === true);
+      check('toolCallTimeoutMs is reported', alpha?.toolCallTimeoutMs === 60000);
+      check('source and managed agree', alpha?.managed === true && beta?.managed === false);
+      check('totals count servers, enabled, active and tools', view.totals.servers === 2 && view.totals.enabled === 1 && view.totals.active === 1 && view.totals.tools === 2, JSON.stringify(view.totals));
+      check('the patch path is reported', view.patch.path === patchPath && view.patch.ok === true);
+      check('a plaintext credential is diagnosed', view.problems.some((problem) => problem.level === 'warn' && problem.message.includes('GITHUB_PERSONAL_ACCESS_TOKEN')));
+      check('the response never contains the plaintext credential', !JSON.stringify(view).includes('ghp_literalvalue1234567890'));
+      check('the response never contains the evaluated secret', !JSON.stringify(view).includes('EVALUATED'));
+      clearProbes();
+      check('clearProbes empties the cache', lastProbeOf('alpha') === null);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  }
+
+  // ------------------------------------------------------------------ H. toggle
+  section('H. enable/disable');
+  {
+    const ctx = {
+      pluginManager: {
+        listPlugins: async () => [
+          { entryId: 'include:a', patchId: 'mcp-client-a', moduleName: MCP_CLIENT_PACKAGE, enabled: true, fiberPhase: 'active' },
+          { entryId: 'include:locked', readOnlyReason: 'management-required', moduleName: MCP_CLIENT_PACKAGE, enabled: true, fiberPhase: 'active' },
+          { entryId: 'include:other', patchId: 'other', moduleName: '@deepseek-ai/something-else', enabled: true, fiberPhase: 'active' },
+        ],
+        setPluginEnabled: async () => ({ changed: true, application: 'applied', enabled: false }),
+      },
+    };
+    const applied = await setServerEnabled(ctx, 'include:a', false);
+    check('a hot change reports application=applied', applied.application === 'applied' && applied.changed === true);
+
+    const failingCtx = {
+      pluginManager: {
+        listPlugins: async () => [{ entryId: 'include:a', patchId: 'mcp-client-a', moduleName: MCP_CLIENT_PACKAGE, enabled: true }],
+        setPluginEnabled: async () => ({ changed: false, application: 'failed', error: { code: 'unknown-plugin' } }),
+      },
+    };
+    let failedMessage = '';
+    try {
+      await setServerEnabled(failingCtx, 'include:a', false);
+    } catch (error) {
+      failedMessage = `${error.code}: ${error.message}`;
+    }
+    check('a failed application becomes a conflict', failedMessage.startsWith('conflict'), failedMessage);
+
+    let missing = '';
+    try {
+      await setServerEnabled(ctx, 'include:missing', false);
+    } catch (error) {
+      missing = `${error.code}: ${error.message}`;
+    }
+    check('an unknown entry is not-found', missing.startsWith('not-found'), missing);
+
+    let locked = '';
+    try {
+      await setServerEnabled(ctx, 'include:locked', false);
+    } catch (error) {
+      locked = `${error.code}: ${error.message}`;
+    }
+    check('a row without a patchId is not-manageable', locked.startsWith('not-manageable'), locked);
+
+    let notMcp = '';
+    try {
+      await setServerEnabled(ctx, 'include:other', false);
+    } catch (error) {
+      notMcp = `${error.code}: ${error.message}`;
+    }
+    check('a non-MCP entry is not-manageable', notMcp.startsWith('not-manageable'), notMcp);
+  }
+
+  // ------------------------------------------------------------------ I. update
+  section('I. raw-layer edit');
+  {
+    const inherited = {
+      transport: 'stdio',
+      serverName: 'alpha',
+      command: 'python',
+      env: {
+        API_KEY: 'literal-secret-value',
+        KEEP_ME: { __jsExpr: 'process.env.KEEP_ME' },
+      },
+    };
+    const entry = { id: 'include:mcp-client-alpha', options: { id: 'mcp-client-alpha', name: MCP_CLIENT_PACKAGE } };
+    let captured = null;
+    const makeCtx = (override = {}) => ({
+      configEditor: {
+        entries: () => [entry],
+        configuration: () => [{ entry, inherited, override }],
+        edit: async (_entry, change) => {
+          // The evaluated config a real ConfigEditor passes first: plaintext, defaults
+          // materialised. If the implementation ever reads it, these values leak.
+          const evaluated = {
+            transport: 'stdio',
+            serverName: 'alpha',
+            command: 'python',
+            env: { API_KEY: 'EVALUATED-PLAINTEXT', KEEP_ME: 'EVALUATED-KEEP' },
+          };
+          captured = change(evaluated, inherited);
+        },
+      },
+    });
+
+    const updated = await updateServerConfig(makeCtx(), { patchId: 'mcp-client-alpha', config: { toolCallTimeoutMs: 120000 } });
+    check('an update reports changed', updated.changed === true);
+    check('the inherited command is preserved', captured?.command === 'python');
+    check('the new field is applied', captured?.toolCallTimeoutMs === 120000);
+    check('a literal credential is kept from inherited, not from the evaluated config', captured?.env?.API_KEY === 'literal-secret-value');
+    check('the evaluated config is never read', captured?.env?.API_KEY !== 'EVALUATED-PLAINTEXT');
+
+    const kept = await updateServerConfig(makeCtx(), {
+      patchId: 'mcp-client-alpha',
+      config: { env: { KEEP_ME: { __keep: true }, API_KEY: { __keep: true } } },
+    });
+    check('{__keep:true} restores the inherited value', captured?.env?.KEEP_ME?.__jsExpr === 'process.env.KEEP_ME');
+    check('every {__keep:true} key is restored from the inherited layer', captured?.env?.API_KEY === 'literal-secret-value');
+    check('a keep-only update still reports changed', kept.changed === true);
+
+    let missingKeep = '';
+    try {
+      await updateServerConfig(makeCtx(), { patchId: 'mcp-client-alpha', config: { env: { ABSENT: { __keep: true } } } });
+    } catch (error) {
+      missingKeep = `${error.code}: ${JSON.stringify(error.details)}`;
+    }
+    check('a {__keep} with no inherited value is a 400 naming the key', missingKeep.startsWith('bad-request') && missingKeep.includes('env.ABSENT'), missingKeep);
+
+    const resolved = resolveKeepSentinels(inherited, { env: { KEEP_ME: { __keep: true } } });
+    check('keep resolution reports nothing missing when the key exists', resolved.missing.length === 0);
+    check('assertKeepResolved is a no-op when nothing is missing', assertKeepResolved([]) === undefined);
+
+    const migrated = await updateServerConfig(makeCtx(), { patchId: 'mcp-client-alpha', migrateSecrets: true });
+    check('migrateSecrets rewrites a literal credential as a reference', captured?.env?.API_KEY?.__jsExpr === 'process.env.API_KEY', JSON.stringify(captured?.env?.API_KEY));
+    check('migrateSecrets reports the migrated keys', JSON.stringify(migrated.migrated) === JSON.stringify(['API_KEY']), JSON.stringify(migrated.migrated));
+    check('migrateSecrets moves no value', !JSON.stringify(captured).includes('literal-secret-value'));
+
+    const literalMap = { env: { TOKEN: 'abc', SAFE: 'x', ALREADY: { __jsExpr: 'process.env.ALREADY' } } };
+    const migratedMap = migrateSecretLiterals(literalMap);
+    check('only credential-shaped literals migrate', JSON.stringify(migratedMap.migrated) === JSON.stringify(['TOKEN']));
+    check('non-secret literals are untouched', literalMap.env.SAFE === 'x');
+
+    const switched = sanitizeMerged({ transport: 'streamable-http', serverName: 'alpha', url: 'https://x.test', command: 'python', args: ['-m'], env: { A: '1' }, cwd: '/tmp' });
+    check('switching to http drops the stdio-only keys', switched.command === undefined && switched.env === undefined && switched.url === 'https://x.test');
+    const switchedBack = sanitizeMerged({ transport: 'stdio', serverName: 'alpha', command: 'python', url: 'https://x.test', headers: { A: 'b' } });
+    check('switching to stdio drops the http-only keys', switchedBack.url === undefined && switchedBack.headers === undefined && switchedBack.command === 'python');
+
+    // A previous edit lands in the profile override; the effective raw layer (what the
+    // page displayed) is `{...inherited, ...override}`, so `{__keep}` and migration must
+    // resolve against that layer, not against the base bundle alone.
+    const overrideLayer = {
+      transport: 'stdio',
+      serverName: 'alpha',
+      command: 'python',
+      env: {
+        API_KEY: 'from-override',
+        OVERRIDE_ONLY: { __jsExpr: 'process.env.OVERRIDE_ONLY' },
+      },
+    };
+    await updateServerConfig(makeCtx(overrideLayer), {
+      patchId: 'mcp-client-alpha',
+      config: { env: { API_KEY: { __keep: true } } },
+    });
+    check('{__keep:true} resolves a value that lives in the profile override', captured?.env?.API_KEY === 'from-override');
+    await updateServerConfig(makeCtx(overrideLayer), { patchId: 'mcp-client-alpha', migrateSecrets: true });
+    check('migrateSecrets sees the profile override values', captured?.env?.API_KEY?.__jsExpr === 'process.env.API_KEY', JSON.stringify(captured?.env));
+    check('migrateSecrets leaves override expressions alone', captured?.env?.OVERRIDE_ONLY?.__jsExpr === 'process.env.OVERRIDE_ONLY');
+  }
+
+  // ------------------------------------------------------- J. add/remove on disk
+  section('J. add / remove against a temp profile');
+  {
+    const dir = await mkdtemp(join(tmpdir(), 'mcp-manager-flow-'));
+    try {
+      const patchPath = join(dir, 'cordis.patch.yml');
+      const original = '# stand-in profile patch\n- id: ui-theme\n  config:\n    preference: light\n';
+      await writeFile(patchPath, original, 'utf8');
+
+      // A manager that behaves like the host: it reads the patch file and reports a
+      // live row for each managed row that parses — i.e. it "composes" whatever was
+      // written, which is what HMR does for the real profile.
+      const composeLike = () => ({
+        listPlugins: async () => {
+          const text = await readFile(patchPath, 'utf8');
+          return inspectPatch(text)
+            .rows.filter((row) => row.managed && row.isMcpClient)
+            .map((row) => ({
+              entryId: `include:${row.patchId}`,
+              patchId: row.patchId,
+              moduleName: MCP_CLIENT_PACKAGE,
+              enabled: true,
+              fiberPhase: 'active',
+            }));
+        },
+      });
+
+      const added = await addManagedServer({ configEditor: { documentPath: patchPath }, pluginManager: composeLike() }, sampleServer());
+      check('an add returns its derived patchId', added.patchId === 'mcp-client-demo');
+      check('an add reports applied', added.applied === 'applied');
+      const afterAdd = await readFile(patchPath, 'utf8');
+      check('the original document bytes are preserved', afterAdd.startsWith(original));
+      check('the managed block exists on disk', afterAdd.includes(MANAGED_BEGIN));
+      check('the new row is inside the managed block', inspectPatch(afterAdd).managedIds.includes('mcp-client-demo'));
+      check('the add made a backup', existsSync(join(dir, 'data', 'mcp-manager')));
+
+      const removed = await removeManagedServer({ configEditor: { documentPath: patchPath }, pluginManager: composeLike() }, 'mcp-client-demo');
+      check('a remove reports removed', removed.removed === true);
+      check('a managed remove reports source=managed', removed.source === 'managed', String(removed.source));
+      check('a managed remove reports its backup path', typeof removed.backupPath === 'string' && existsSync(removed.backupPath), String(removed.backupPath));
+      check('the backup holds the pre-removal document', (await readFile(removed.backupPath, 'utf8')) === afterAdd);
+      const afterRemove = await readFile(patchPath, 'utf8');
+      check('removal keeps the original bytes', afterRemove.startsWith(original));
+      check('the row is gone from the block', !afterRemove.includes('mcp-client-demo'));
+      check('the block survives as an empty insert list', afterRemove.includes('- insert: []'));
+
+      // Rollback: a host that never composes the row must not leave it behind.
+      const neverComposes = { configEditor: { documentPath: patchPath }, pluginManager: { listPlugins: async () => [] } };
+      let rollbackError = '';
+      try {
+        await addManagedServer(neverComposes, sampleServer({ serverName: 'ghost' }));
+      } catch (error) {
+        rollbackError = `${error.code}: ${error.message}`;
+      }
+      check('an uncomposed add is a write-failed error', rollbackError.startsWith('write-failed'), rollbackError);
+      const afterRollback = await readFile(patchPath, 'utf8');
+      check('the rollback restored the document', afterRollback === afterRemove);
+      check('the rolled-back row is absent', !afterRollback.includes('mcp-client-ghost'));
+
+      // An id that exists nowhere is still a 404.
+      let outside = '';
+      try {
+        await removeManagedServer({ configEditor: { documentPath: patchPath }, pluginManager: composeLike() }, 'mcp-client-nonexistent');
+      } catch (error) {
+        outside = `${error.code}: ${error.message}`;
+      }
+      check('deleting an unknown row id is refused as not-found', outside.startsWith('not-found'), outside);
+
+      // Import end to end: the contract's mapping plus the reported drops.
+      const importCtx = { configEditor: { documentPath: patchPath }, pluginManager: composeLike() };
+      const payload = {
+        mode: 'add',
+        mcpServers: {
+          'imp-http': { type: 'sse', url: 'https://example.test/mcp', autoApprove: ['*'] },
+          'imp-stdio': { command: 'python', args: ['-m', 'imp'], env: { API_KEY: '${IMP_KEY}' } },
+        },
+      };
+      const imported = await importServers(importCtx, payload);
+      check('import adds every valid server', imported.added.length === 2, JSON.stringify(imported.added));
+      check(
+        'import reports the sse substitution and the dropped fields',
+        imported.droppedFields.some(
+          (entry) => entry.serverName === 'imp-http' && entry.fields.includes('transport:sse→streamable-http') && entry.fields.includes('autoApprove'),
+        ),
+        JSON.stringify(imported.droppedFields),
+      );
+      const afterImport = inspectPatch(await readFile(patchPath, 'utf8'));
+      const stdioRow = afterImport.rows.find((row) => row.serverName === 'imp-stdio');
+      check(
+        'an imported ${VAR} becomes an unevaluated env expression',
+        stdioRow?.envKeys.some((entry) => entry.key === 'API_KEY' && entry.isJsExpr === true && entry.jsExpr === 'process.env.IMP_KEY'),
+        JSON.stringify(stdioRow?.envKeys),
+      );
+      check('imported rows live in the managed block', afterImport.managedIds.length === 2, JSON.stringify(afterImport.managedIds));
+
+      const again = await importServers(importCtx, payload);
+      check('re-importing the same names is skipped, not duplicated', again.added.length === 0 && again.skipped.length === 2, JSON.stringify(again.skipped));
+      let badMode = '';
+      try {
+        await importServers(importCtx, { mode: 'overwrite', mcpServers: {} });
+      } catch (error) {
+        badMode = `${error.code}: ${error.message}`;
+      }
+      check('an unsupported import mode is a bad-request', badMode.startsWith('bad-request'), badMode);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  }
+
+  // ------------------------------------ J2. hand-written row deletion
+  section('J2. hand-written row deletion');
+  {
+    const dir = await mkdtemp(join(tmpdir(), 'mcp-manager-handwritten-'));
+    /** A manager that reports a live entry for every MCP row the patch currently declares. */
+    const composeFrom = (path) => ({
+      listPlugins: async () => {
+        const info = inspectPatch(await readFile(path, 'utf8'));
+        return info.rows
+          .filter((row) => row.nested && row.isMcpClient)
+          .map((row) => ({
+            entryId: `include:${row.patchId}`,
+            patchId: row.patchId,
+            moduleName: MCP_CLIENT_PACKAGE,
+            enabled: true,
+            fiberPhase: 'active',
+          }));
+      },
+    });
+    try {
+      // --- the main fixture: a hand-written row in a shared insert list, plus its
+      // top-level disabled override and a neighbouring row that must survive.
+      const mainPath = join(dir, 'cordis.patch.yml');
+      const rowBlock = `    - id: mcp-client-hand
+      name: '@deepseek-ai/dsh-mcp-client'
+      config:
+        transport: stdio
+        serverName: 'hand'
+        command: 'python'
+`;
+      const overrideBlock = `- id: mcp-client-hand
+  disabled: true
+`;
+      const original = `# profile patch (hand-written row stand-in)
+- id: ui-theme
+  name: "@deepseek-ai/dsh-client-ui-theme"
+  config:
+    preference: light
+# MCP servers live in this insert list
+- insert:
+    # hand-written MCP row below
+${rowBlock}    - id: mcp-client-keep
+      name: '@deepseek-ai/dsh-mcp-client'
+      config:
+        transport: stdio
+        serverName: 'keep'
+        command: 'node'
+${overrideBlock}- id: plugin-market
+  name: "@deepseek-ai/dsh-plugin-market"
+  config:
+    indexes: []
+`;
+      const expected = original.replace(rowBlock, '').replace(overrideBlock, '');
+      await writeFile(mainPath, original, 'utf8');
+
+      const handCtx = { configEditor: { documentPath: mainPath }, pluginManager: composeFrom(mainPath) };
+      const deleted = await removeManagedServer(handCtx, 'mcp-client-hand');
+      check('a hand-written row can be deleted', deleted.removed === true);
+      check('the removal reports source=handwritten', deleted.source === 'handwritten', String(deleted.source));
+      check('the removal reports its backup path', typeof deleted.backupPath === 'string' && existsSync(deleted.backupPath), String(deleted.backupPath));
+      check('the backup holds the pre-removal document', (await readFile(deleted.backupPath, 'utf8')) === original);
+
+      const after = await readFile(mainPath, 'utf8');
+      check('the rewritten document equals original minus the row and its override (byte-exact)', after === expected, JSON.stringify(after.slice(0, 120)));
+      check(
+        'exactly the target row plus its override disappear (line count)',
+        original.split('\n').length - after.split('\n').length === 8,
+        `${original.split('\n').length}->${after.split('\n').length}`,
+      );
+      check('the neighbouring hand-written row is untouched', after.includes("    - id: mcp-client-keep\n      name: '@deepseek-ai/dsh-mcp-client'"));
+      check('the comment above the removed row survives', after.includes('    # hand-written MCP row below'));
+      check('the unrelated top-level rows are untouched', after.includes('- id: plugin-market\n  name: "@deepseek-ai/dsh-plugin-market"'));
+      check('the same-id disabled override is gone', !after.includes('- id: mcp-client-hand'));
+      check('the rewritten document still parses', inspectPatch(after).ok);
+      check(
+        'the deleted row is gone from the parsed model',
+        !inspectPatch(after).rows.some((row) => row.patchId === 'mcp-client-hand'),
+      );
+      check(
+        'all other row ids survive in order',
+        JSON.stringify(inspectPatch(after).rows.map((row) => row.patchId)) ===
+          JSON.stringify(['ui-theme', 'mcp-client-keep', 'plugin-market']),
+        JSON.stringify(inspectPatch(after).rows.map((row) => row.patchId)),
+      );
+
+      // --- a list that this deletion empties becomes an explicit empty insert list.
+      const soloPath = join(dir, 'solo.patch.yml');
+      const soloOriginal = `# only row in this list
+- insert:
+    - id: mcp-client-solo
+      name: '@deepseek-ai/dsh-mcp-client'
+      config:
+        transport: stdio
+        serverName: 'solo'
+        command: 'python'
+- id: tail
+  config: {}
+`;
+      const soloExpected = `# only row in this list
+- insert: []
+- id: tail
+  config: {}
+`;
+      await writeFile(soloPath, soloOriginal, 'utf8');
+      const solo = await removeManagedServer({ configEditor: { documentPath: soloPath }, pluginManager: composeFrom(soloPath) }, 'mcp-client-solo');
+      check('deleting the only row of an insert list succeeds', solo.removed === true);
+      check('an emptied insert list becomes - insert: []', (await readFile(soloPath, 'utf8')) === soloExpected, JSON.stringify(await readFile(soloPath, 'utf8')));
+
+      // --- error branches: nothing is written.
+      const foreignPath = join(dir, 'foreign.patch.yml');
+      const foreignOriginal = "- insert:\n    - id: foreign-row\n      name: '@deepseek-ai/some-other-plugin'\n      config:\n        a: 1\n";
+      await writeFile(foreignPath, foreignOriginal, 'utf8');
+      let foreignError = '';
+      try {
+        await removeManagedServer({ configEditor: { documentPath: foreignPath }, pluginManager: composeFrom(foreignPath) }, 'foreign-row');
+      } catch (error) {
+        foreignError = `${error.code}: ${error.message}`;
+      }
+      check('a non-MCP insert row is refused as not-manageable', foreignError.startsWith('not-manageable'), foreignError);
+      check('the refused non-MCP deletion wrote nothing', (await readFile(foreignPath, 'utf8')) === foreignOriginal);
+
+      const orphanPath = join(dir, 'orphan.patch.yml');
+      const orphanOriginal = '- id: mcp-client-orphan\n  disabled: true\n- id: ui-theme\n  config: {}\n';
+      await writeFile(orphanPath, orphanOriginal, 'utf8');
+      let orphanError = '';
+      try {
+        await removeManagedServer({ configEditor: { documentPath: orphanPath }, pluginManager: composeFrom(orphanPath) }, 'mcp-client-orphan');
+      } catch (error) {
+        orphanError = `${error.code}: ${error.message}`;
+      }
+      check('an override without an insert definition is refused as not-manageable', orphanError.startsWith('not-manageable'), orphanError);
+      check('the refused orphan deletion wrote nothing', (await readFile(orphanPath, 'utf8')) === orphanOriginal);
+
+      // A flow-style insert list cannot be edited line-by-line without taking its
+      // neighbours, so it is refused instead of corrupted.
+      const flowPath = join(dir, 'flow.patch.yml');
+      const flowOriginal = "- insert: [{ id: 'flow-row', name: '@deepseek-ai/dsh-mcp-client', config: { transport: 'stdio', serverName: 'flow', command: 'python' } }, { id: 'flow-keep', name: '@deepseek-ai/dsh-mcp-client', config: { transport: 'stdio', serverName: 'flow-keep', command: 'node' } }]\n";
+      await writeFile(flowPath, flowOriginal, 'utf8');
+      let flowError = '';
+      try {
+        await removeManagedServer({ configEditor: { documentPath: flowPath }, pluginManager: composeFrom(flowPath) }, 'flow-row');
+      } catch (error) {
+        flowError = `${error.code}: ${error.message}`;
+      }
+      check('a row in a flow-style insert list is refused as not-manageable', flowError.startsWith('not-manageable'), flowError);
+      check('the refused flow-style deletion wrote nothing', (await readFile(flowPath, 'utf8')) === flowOriginal);
+
+      const brokenPath = join(dir, 'broken.patch.yml');
+      const brokenOriginal = '- insert:\n    - id: [unclosed\n';
+      await writeFile(brokenPath, brokenOriginal, 'utf8');
+      let brokenError = '';
+      try {
+        await removeManagedServer({ configEditor: { documentPath: brokenPath }, pluginManager: composeFrom(brokenPath) }, 'mcp-client-whatever');
+      } catch (error) {
+        brokenError = `${error.code}: ${error.message}`;
+      }
+      check('deleting from a patch that does not parse is refused as patch-invalid', brokenError.startsWith('patch-invalid'), brokenError);
+      check('the refused broken-patch deletion wrote nothing', (await readFile(brokenPath, 'utf8')) === brokenOriginal);
+
+      // --- rollback: the host keeps reporting the entry after the write.
+      const stuckPath = join(dir, 'stuck.patch.yml');
+      const stuckOriginal = `- insert:
+    - id: mcp-client-stuck
+      name: '@deepseek-ai/dsh-mcp-client'
+      config:
+        transport: stdio
+        serverName: 'stuck'
+        command: 'python'
+`;
+      await writeFile(stuckPath, stuckOriginal, 'utf8');
+      const stuckCtx = {
+        configEditor: { documentPath: stuckPath },
+        pluginManager: {
+          listPlugins: async () => [
+            { entryId: 'include:mcp-client-stuck', patchId: 'mcp-client-stuck', moduleName: MCP_CLIENT_PACKAGE, enabled: true, fiberPhase: 'active' },
+          ],
+        },
+      };
+      let rollbackError = '';
+      try {
+        await removeManagedServer(stuckCtx, 'mcp-client-stuck');
+      } catch (error) {
+        rollbackError = `${error.code}: ${error.message}`;
+      }
+      check('a hand-written remove whose entry survives is a write-failed error', rollbackError.startsWith('write-failed'), rollbackError);
+      check('the failed hand-written remove rolled the document back byte-for-byte', (await readFile(stuckPath, 'utf8')) === stuckOriginal);
+      check('the rollback message names the backup', rollbackError.includes('backup:'), rollbackError);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  }
+
+  // -------------------------------------------------- K. security/HTTP helpers
+  section('K. HTTP security helpers');
+  {
+    const denied = mockResponse();
+    const deniedResult = rejectUnauthorized({ connection: { requestRejection: () => 401 } }, {}, denied);
+    check('a rejection finishes the response with its status', deniedResult === true && denied.statusCode === 401 && denied.ended);
+
+    const allowed = mockResponse();
+    check('an allowed request passes the gate', rejectUnauthorized({ connection: { requestRejection: () => undefined } }, {}, allowed) === false);
+
+    const failingGate = mockResponse();
+    check('a throwing gate fails closed', rejectUnauthorized({ connection: { requestRejection: () => { throw new Error('boom'); } } }, {}, failingGate) === true && failingGate.statusCode === 500);
+
+    const method = mockResponse();
+    check('a wrong method is refused with allow', requireMethod({ method: 'GET' }, method, 'POST') === false && method.statusCode === 405 && method.headers.allow === 'POST');
+
+    const notJson = mockResponse();
+    check('a non-JSON mutation body is refused', requireJson({ headers: { 'content-type': 'text/plain' } }, notJson) === false && notJson.statusCode === 415);
+
+    const jsonOk = mockResponse();
+    check('a JSON content type is accepted', requireJson({ headers: { 'content-type': 'application/json; charset=utf-8' } }, jsonOk) === true);
+
+    async function* body(text) {
+      yield Buffer.from(text, 'utf8');
+    }
+    const parsed = await readJsonBody(body('{"a":1}'));
+    check('a bounded JSON body parses', parsed.a === 1);
+
+    let tooLarge = '';
+    try {
+      await readJsonBody({ async *[Symbol.asyncIterator]() { yield Buffer.alloc(70 * 1024); } });
+    } catch (error) {
+      tooLarge = `${error.code}: ${error.status}`;
+    }
+    check('an oversized body is refused with 413', tooLarge === 'bad-request: 413', tooLarge);
+
+    let badJson = '';
+    try {
+      await readJsonBody(body('{oops'));
+    } catch (error) {
+      badJson = error.code;
+    }
+    check('malformed JSON is a bad-request', badJson === 'bad-request');
+
+    const sent = mockResponse();
+    sendJson(sent, 201, { ok: true });
+    check('JSON responses are no-store', sent.statusCode === 201 && sent.headers['cache-control'] === 'no-store');
+    check('JSON responses carry a content length', Number(sent.headers['content-length']) > 0);
+
+    const errored = mockResponse();
+    sendError(errored, new ApiError('conflict', 'nope'));
+    check('contract codes map to their status', errored.statusCode === 409 && JSON.parse(errored.body).error.code === 'conflict');
+
+    const masked = redact('token ghp_abcdefghijklmnopqrstuvwxyz0123 and GITHUB_TOKEN: hunter2 and sk-abcdefghijklmnopqrstu', ['hunter2']);
+    check('github tokens are masked', !masked.includes('ghp_abcdefghijklmnopqrstuvwxyz0123'), masked);
+    check('known secret values are masked', !masked.includes('hunter2'));
+    check('sk-style tokens are masked', !masked.includes('sk-abcdefghijklmnopqrstu'));
+  }
+
+  // --------------------------------------------------------------- L. diagnostics
+  section('L. diagnostics');
+  {
+    const rows = [
+      { isMcpClient: true, patchId: 'mcp-client-a', serverName: 'alpha', transport: 'stdio', command: 'python', envKeys: [{ key: 'DEMO_KEY', isJsExpr: true, jsExpr: 'process.env.DEMO_UNSET_VAR' }], envLiteralKeys: [], headerLiteralKeys: [] },
+      { isMcpClient: true, patchId: 'mcp-client-b', serverName: 'alpha', transport: 'stdio', command: 'python', envKeys: [], envLiteralKeys: ['GITHUB_PERSONAL_ACCESS_TOKEN'], headerLiteralKeys: [] },
+      { isMcpClient: true, patchId: 'mcp-client-c', serverName: 'bad name', transport: 'stdio', command: 'missing-binary', envKeys: [], envLiteralKeys: [], headerLiteralKeys: [] },
+    ];
+    const problems = diagnose(rows, { env: {}, exists: () => false });
+    check('a duplicate serverName is an error', problems.some((problem) => problem.level === 'error' && problem.message.includes('also used by')));
+    check('an illegal serverName is an error', problems.some((problem) => problem.level === 'error' && problem.message.includes('violates')));
+    check('a missing command is a warning', problems.some((problem) => problem.level === 'warn' && problem.message.includes('command not found')));
+    check('an unset env reference is a warning', problems.some((problem) => problem.level === 'warn' && problem.message.includes('DEMO_UNSET_VAR')));
+    check('a literal credential is a warning', problems.some((problem) => problem.level === 'warn' && problem.message.includes('GITHUB_PERSONAL_ACCESS_TOKEN')));
+    check('a broken patch is a global error', diagnose([], { patchOk: false, patchError: 'bad yaml' }).some((problem) => problem.level === 'error' && problem.message.includes('bad yaml')));
+    check('isSecretName recognises header credentials', isSecretName('Authorization', { header: true }) && !isSecretName('Authorization'));
+  }
+
+  // ------------------------------------------------------ M. real profile dry run
+  section('M. real profile (read-only)');
+  {
+    const real =
+      process.env.MCP_MANAGER_REAL_PATCH ??
+      join(homedir(), '.dsh', 'profiles', process.env.DSH_PROFILE ?? 'desktop', 'cordis.patch.yml');
+    try {
+      const before = await readFile(real, 'utf8');
+      const info = inspectPatch(before);
+      check('the real profile patch parses', info.ok, info.error ?? '');
+      const mcpRows = info.rows.filter((row) => row.isMcpClient);
+      // 真实 profile 的 MCP 行数取决于本机安装状态（全新 ~/.dsh 可能为 0 行），
+      // 0 行时跳过该断言而不是判失败；其余不变量对空集合自然成立。
+      if (mcpRows.length === 0) {
+        console.log('SKIP  the real profile declares no MCP rows in this environment');
+      } else {
+        check('the real profile declares MCP rows', true, `rows=${mcpRows.length}`);
+      }
+      check('every real MCP row carries a serverName', mcpRows.every((row) => typeof row.serverName === 'string' && row.serverName !== ''));
+      check('every real MCP row names the mcp-client package', mcpRows.every((row) => row.name === MCP_CLIENT_PACKAGE));
+      // 这台机器上只要用本页面新增过服务器，真实 profile 里就会有管理块——那是正常状态，
+      // 不是「首次安装」。断言改成状态无关的不变量：管理块里只允许出现 MCP 客户端行。
+      const managedRows = info.rows.filter((row) => info.managedIds.includes(row.patchId));
+      check(
+        'every managed row in the real profile is an MCP client row',
+        managedRows.every((row) => row.isMcpClient),
+        info.managedIds.join(','),
+      );
+      // dry-run 的硬约束是「块外字节一个不动」：没有块时是追加到文末，有块时只替换块内。
+      const realBlock = managedSpan(before);
+      const planned = planAdd(before, sampleServer({ serverName: 'smoke-dry-run' }));
+      const outsideKept =
+        realBlock === null
+          ? planned.next.startsWith(before)
+          : planned.next.startsWith(before.slice(0, realBlock.begin)) && planned.next.endsWith(before.slice(realBlock.end));
+      check('a dry-run add keeps every byte outside the managed block', outsideKept);
+      check(
+        'the dry-run result has exactly one more managed row',
+        inspectPatch(planned.next).managedIds.length === info.managedIds.length + 1,
+        `${info.managedIds.length}->${inspectPatch(planned.next).managedIds.length}`,
+      );
+      check('the dry-run result parses', inspectPatch(planned.next).ok);
+      check('the dry run wrote nothing', (await readFile(real, 'utf8')) === before);
+      console.log('       (read-only: the real profile was not modified)');
+    } catch (error) {
+      console.log(`SKIP  real profile not reachable: ${error?.message ?? error}`);
+    }
+  }
+
+  // ------------------------------------------------------ N. route registration
+  section('N. route wiring');
+  {
+    check('the plugin is named as the patch row expects', pluginName === 'mcp-manager');
+    check(
+      'the plugin injects the services its routes and project runtime use',
+      JSON.stringify(injectedServices) ===
+        JSON.stringify(['webServer', 'connection', 'pluginManager', 'configEditor', 'subprocess', 'tools', 'workingDirectory']),
+      JSON.stringify(injectedServices),
+    );
+
+    const dir = await mkdtemp(join(tmpdir(), 'mcp-manager-routes-'));
+    try {
+      const patchPath = join(dir, 'cordis.patch.yml');
+      await writeFile(patchPath, '- id: ui-theme\n  config: {}\n', 'utf8');
+      const routes = [];
+      const disposers = [];
+      let rejection = undefined;
+      const ctx = {
+        effect(fn) {
+          const dispose = fn();
+          disposers.push(dispose);
+          return dispose;
+        },
+        webServer: {
+          register(route) {
+            routes.push(route);
+            return () => {
+              route.disposed = true;
+            };
+          },
+        },
+        connection: {
+          requestRejection: () => rejection,
+        },
+        pluginManager: {
+          listPlugins: async () => [],
+        },
+        configEditor: {
+          documentPath: patchPath,
+          entries: () => [],
+          configuration: () => [],
+        },
+        subprocess: {},
+        tools: { schemas: () => [] },
+      };
+      apply(ctx);
+
+      const paths = routes.map((route) => route.path).sort();
+      check(
+        'all global and project routes are registered',
+        JSON.stringify(paths) ===
+          JSON.stringify(
+            [
+              '/mcp-manager/api/export',
+              '/mcp-manager/api/import',
+              '/mcp-manager/api/probe',
+              '/mcp-manager/api/project',
+              '/mcp-manager/api/project/add',
+              '/mcp-manager/api/project/remove',
+              '/mcp-manager/api/project/toggle',
+              '/mcp-manager/api/project/trust',
+              '/mcp-manager/api/project/update',
+              '/mcp-manager/api/servers',
+              '/mcp-manager/api/servers/add',
+              '/mcp-manager/api/servers/reconnect',
+              '/mcp-manager/api/servers/remove',
+              '/mcp-manager/api/servers/toggle',
+              '/mcp-manager/api/servers/toggle-batch',
+              '/mcp-manager/api/servers/update',
+            ].sort(),
+          ),
+        JSON.stringify(paths),
+      );
+      check('every route is an exact path registration', routes.every((route) => route.kind === 'exact'));
+
+      const getRoute = routes.find((route) => route.path === '/mcp-manager/api/servers');
+      const okResponse = mockResponse();
+      await getRoute.handler({ method: 'GET', headers: {} }, okResponse);
+      const okBody = JSON.parse(okResponse.body || '{}');
+      check('GET /servers answers 200 with the contract envelope', okResponse.statusCode === 200 && Array.isArray(okBody.servers) && okBody.patch?.path === patchPath && Array.isArray(okBody.problems) && okBody.totals?.servers === 0, okResponse.body.slice(0, 160));
+      check('GET /servers exposes the last snapshot path', 'snapshotPath' in okBody, Object.keys(okBody).join(','));
+
+      rejection = 401;
+      const deniedResponse = mockResponse();
+      await getRoute.handler({ method: 'GET', headers: {} }, deniedResponse);
+      check('an unauthenticated request is refused before any work', deniedResponse.statusCode === 401 && deniedResponse.body === '');
+      rejection = undefined;
+
+      const toggle = routes.find((route) => route.path === '/mcp-manager/api/servers/toggle');
+      const wrongMethod = mockResponse();
+      await toggle.handler({ method: 'GET', headers: {} }, wrongMethod);
+      check('a mutation route refuses GET with 405', wrongMethod.statusCode === 405);
+
+      const plainText = mockResponse();
+      await toggle.handler({ method: 'POST', headers: { 'content-type': 'text/plain' } }, plainText);
+      check('a mutation route refuses a non-JSON body with 415', plainText.statusCode === 415);
+
+      const unknownToggle = mockResponse();
+      await toggle.handler(
+        {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          async *[Symbol.asyncIterator]() {
+            yield Buffer.from('{"entryId":"include:nope","enabled":false}', 'utf8');
+          },
+        },
+        unknownToggle,
+      );
+      check('a mutation route answers a classified error', unknownToggle.statusCode === 404 && JSON.parse(unknownToggle.body).error.code === 'not-found', unknownToggle.body);
+
+      const badJson = mockResponse();
+      await toggle.handler(
+        {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          async *[Symbol.asyncIterator]() {
+            yield Buffer.from('{bad', 'utf8');
+          },
+        },
+        badJson,
+      );
+      check('malformed JSON is a 400 through the route', badJson.statusCode === 400);
+
+      // ---------------------------------------------------------- project scope
+      const projectDir = join(dir, 'project');
+      await mkdir(join(projectDir, '.dsh'), { recursive: true });
+      const projectRoute = routes.find((route) => route.path === '/mcp-manager/api/project');
+      const projectFile = join(projectDir, '.dsh', 'mcp.json');
+      const postJson = async (route, body) => {
+        const response = mockResponse();
+        await route.handler(
+          {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            async *[Symbol.asyncIterator]() {
+              yield Buffer.from(JSON.stringify(body), 'utf8');
+            },
+          },
+          response,
+        );
+        return response;
+      };
+      const getProject = async () => {
+        const response = mockResponse();
+        await projectRoute.handler(
+          { method: 'GET', headers: {}, url: `/mcp-manager/api/project?cwd=${encodeURIComponent(projectDir)}` },
+          response,
+        );
+        return JSON.parse(response.body || '{}');
+      };
+
+      const empty = await getProject();
+      check('GET /project reports a missing file without failing', empty.scope === 'project' && empty.exists === false && Array.isArray(empty.servers));
+
+      const reconnectRoute = routes.find((route) => route.path === '/mcp-manager/api/servers/reconnect');
+      const reconnectUnknown = await postJson(reconnectRoute, { entryId: 'include:nope' });
+      check(
+        'reconnecting an unknown entry is a classified 404',
+        reconnectUnknown.statusCode === 404 && JSON.parse(reconnectUnknown.body || '{}').error?.code === 'not-found',
+        reconnectUnknown.body,
+      );
+
+      const batchRoute = routes.find((route) => route.path === '/mcp-manager/api/servers/toggle-batch');
+      const batchEmpty = await postJson(batchRoute, { entryIds: [], enabled: false });
+      check('an empty batch is a 400', batchEmpty.statusCode === 400, batchEmpty.body);
+      const batchUnknown = await postJson(batchRoute, { entryIds: ['include:nope'], enabled: false });
+      const batchBody = JSON.parse(batchUnknown.body || '{}');
+      check(
+        'a batch reports per-row failures without failing the request',
+        batchUnknown.statusCode === 200 && batchBody.failed === 1 && batchBody.results?.[0]?.error?.code === 'not-found',
+        batchUnknown.body,
+      );
+
+      const added = await postJson(routes.find((route) => route.path === '/mcp-manager/api/project/add'), {
+        cwd: projectDir,
+        server: { serverName: 'demo', transport: 'stdio', command: 'echo', args: ['hello'], env: { TOKEN: 'plain' } },
+      });
+      const addedBody = JSON.parse(added.body || '{}');
+      check('POST /project/add writes .dsh/mcp.json and trusts it', added.statusCode === 200 && addedBody.exists === true && addedBody.trusted === true && addedBody.servers.length === 1, added.body.slice(0, 200));
+      const written = JSON.parse(await readFile(projectFile, 'utf8'));
+      check('the project file uses the standard mcpServers map', written.mcpServers?.demo?.command === 'echo' && Array.isArray(written.disabled), JSON.stringify(written));
+
+      const duplicate = await postJson(routes.find((route) => route.path === '/mcp-manager/api/project/add'), {
+        cwd: projectDir,
+        server: { serverName: 'demo', transport: 'stdio', command: 'echo' },
+      });
+      check('a duplicate project server is refused with 409', duplicate.statusCode === 409, duplicate.body);
+
+      const toggled = await postJson(routes.find((route) => route.path === '/mcp-manager/api/project/toggle'), {
+        cwd: projectDir,
+        serverName: 'demo',
+        enabled: false,
+      });
+      const toggledBody = JSON.parse(toggled.body || '{}');
+      check('POST /project/toggle moves the name into disabled', toggled.statusCode === 200 && toggledBody.servers[0].enabled === false);
+
+      const updated = await postJson(routes.find((route) => route.path === '/mcp-manager/api/project/update'), {
+        cwd: projectDir,
+        serverName: 'demo',
+        config: { transport: 'stdio', command: 'echo2', args: [] },
+      });
+      const updatedBody = JSON.parse(updated.body || '{}');
+      const updatedFile = JSON.parse(await readFile(projectFile, 'utf8'));
+      check('POST /project/update keeps omitted env values', updated.statusCode === 200 && updatedBody.servers[0].command === 'echo2' && updatedFile.mcpServers.demo.env?.TOKEN === 'plain', updatedFile.mcpServers?.demo?.env?.TOKEN);
+
+      // An edit made outside the page invalidates the approval.
+      await writeFile(projectFile, `${JSON.stringify({ mcpServers: { gh: { transport: 'stdio', command: 'gh-mcp' } } }, null, 2)}\n`, 'utf8');
+      const untrusted = await getProject();
+      check('an externally edited file is reported untrusted', untrusted.exists === true && untrusted.trusted === false && untrusted.servers.length === 1);
+      const trusted = await postJson(routes.find((route) => route.path === '/mcp-manager/api/project/trust'), { cwd: projectDir });
+      check('POST /project/trust approves the exact content', JSON.parse(trusted.body || '{}').trusted === true);
+
+      const removed = await postJson(routes.find((route) => route.path === '/mcp-manager/api/project/remove'), {
+        cwd: projectDir,
+        serverName: 'gh',
+      });
+      const removedBody = JSON.parse(removed.body || '{}');
+      check('POST /project/remove deletes the entry', removed.statusCode === 200 && removedBody.servers.length === 0);
+
+      const outside = mockResponse();
+      await projectRoute.handler(
+        { method: 'GET', headers: {}, url: '/mcp-manager/api/project?cwd=' + encodeURIComponent(join(dir, 'nope')) },
+        outside,
+      );
+      check('an unknown project directory is a classified 404', outside.statusCode === 404, outside.body);
+
+      for (const dispose of disposers.splice(0)) dispose();
+      check('disposal unregisters every route', routes.every((route) => route.disposed === true));
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  }
+
+  // ------------------------------------------- O. startup diagnostics snapshot
+  section('O. startup diagnostics snapshot');
+  {
+    const dir = await mkdtemp(join(tmpdir(), 'mcp-manager-snapshot-'));
+    const previousHome = process.env.DSH_HOME;
+    const previousProfile = process.env.DSH_PROFILE;
+    process.env.DSH_HOME = dir;
+    process.env.DSH_PROFILE = 'desktop';
+    try {
+      const patchPath = join(dir, 'cordis.patch.yml');
+      await writeFile(patchPath, '- id: ui-theme\n  config: {}\n', 'utf8');
+
+      const entry = {
+        id: 'include:mcp-client-alpha',
+        options: { id: 'mcp-client-alpha', name: MCP_CLIENT_PACKAGE, config: { serverName: 'alpha' } },
+      };
+      const snapshotCtx = {
+        configEditor: {
+          documentPath: patchPath,
+          entries: () => [entry],
+          configuration: () => [
+            {
+              entry,
+              inherited: {
+                transport: 'stdio',
+                serverName: 'alpha',
+                command: 'python',
+                env: { GITHUB_PERSONAL_ACCESS_TOKEN: 'ghp_snapshotsecret1234567890', SAFE_FLAG: '1' },
+              },
+              override: {},
+            },
+          ],
+        },
+        pluginManager: {
+          listPlugins: async () => [
+            { entryId: entry.id, patchId: 'mcp-client-alpha', moduleName: MCP_CLIENT_PACKAGE, enabled: true, fiberPhase: 'active' },
+          ],
+        },
+        tools: { schemas: () => [{ name: 'mcp__alpha__one' }] },
+        subprocess: { spawn: () => {} },
+      };
+
+      const snapshot = await captureSnapshot(snapshotCtx);
+      check('a snapshot is written under data/mcp-manager', snapshot.includes(join('data', 'mcp-manager')) && snapshot.endsWith('.json'), snapshot);
+      const text = await readFile(snapshot, 'utf8');
+      const parsed = JSON.parse(text);
+      check(
+        'the snapshot carries the full list response',
+        Array.isArray(parsed.servers) &&
+          parsed.servers.length === 1 &&
+          parsed.servers[0].serverName === 'alpha' &&
+          parsed.patch?.path === patchPath &&
+          parsed.totals?.servers === 1,
+        Object.keys(parsed).join(','),
+      );
+      check(
+        'the snapshot records the writer backend',
+        parsed.backend?.atomicWrite === 'used' || parsed.backend?.atomicWrite === 'fallback',
+        JSON.stringify(parsed.backend),
+      );
+      check('the snapshot records the subprocess capability', parsed.backend?.subprocess === 'function', parsed.backend?.subprocess);
+      check('the snapshot records the probe cache size', typeof parsed.backend?.probeCache === 'number');
+      check('the snapshot contains no literal credential', !text.includes('ghp_snapshotsecret1234567890'));
+      check('the snapshot exposes no evaluated config object', !text.includes('EVALUATED'));
+      check('the last snapshot path is exposed for the route layer', lastSnapshotPath() === snapshot);
+
+      // Retention: only the newest ten files survive, and pruning keeps valid JSON.
+      const all = [];
+      for (let index = 0; index < 12; index += 1) all.push(await captureSnapshot(snapshotCtx));
+      const directory = join(dir, 'data', 'mcp-manager');
+      const kept = (await readdir(directory)).filter((name) => name.startsWith('snapshot-') && name.endsWith('.json')).sort();
+      check('only the newest ten snapshots are kept', kept.length === 10, String(kept.length));
+      check('the newest snapshot survives pruning', kept.includes(lastSnapshotPath().split('\\').pop().split('/').pop()));
+      check('the oldest snapshot is pruned', !kept.includes(all[0].split('\\').pop().split('/').pop()));
+      check('every retained snapshot still parses', (await Promise.all(kept.map((name) => readFile(join(directory, name), 'utf8')))).every((body) => {
+        try {
+          JSON.parse(body);
+          return true;
+        } catch {
+          return false;
+        }
+      }));
+
+      // Scheduling is fire-and-forget: it returns a cancel handle immediately and the
+      // read itself happens later.
+      const beforePath = lastSnapshotPath();
+      const beforeCount = (await readdir(directory)).filter((name) => name.startsWith('snapshot-')).length;
+      const cancel = scheduleSnapshot(snapshotCtx, 0);
+      check('scheduling returns a cancel handle without writing yet', typeof cancel === 'function');
+      await new Promise((resolve) => setTimeout(resolve, 150));
+      const afterCount = (await readdir(directory)).filter((name) => name.startsWith('snapshot-')).length;
+      check('the scheduled snapshot runs and becomes the latest', lastSnapshotPath() !== beforePath && lastSnapshotPath() !== null, `${beforeCount}->${afterCount}`);
+      check('retention still bounds the scheduled snapshot', afterCount >= 1 && afterCount <= 10, String(afterCount));
+      cancel();
+
+      // Without a config editor the profile directory is reconstructed from
+      // DSH_HOME/DSH_PROFILE, which is what an early or degraded mount looks like.
+      const fallbackPath = await captureSnapshot({
+        pluginManager: { listPlugins: async () => [] },
+        tools: { schemas: () => [] },
+        subprocess: { spawn: () => {} },
+      });
+      check(
+        'without a patch path the profile dir falls back to DSH_HOME/profiles/DSH_PROFILE',
+        fallbackPath.startsWith(join(dir, 'profiles', 'desktop')),
+        fallbackPath,
+      );
+      check('the fallback snapshot still parses', JSON.parse(await readFile(fallbackPath, 'utf8')).backend?.atomicWrite !== undefined);
+    } finally {
+      if (previousHome === undefined) delete process.env.DSH_HOME;
+      else process.env.DSH_HOME = previousHome;
+      if (previousProfile === undefined) delete process.env.DSH_PROFILE;
+      else process.env.DSH_PROFILE = previousProfile;
+      await rm(dir, { recursive: true, force: true });
+    }
+  }
+
+  // ------------------------------------------- P. environment variable bridge
+  section('P. environment variable bridge');
+  {
+    const dir = await mkdtemp(join(tmpdir(), 'mcp-manager-envb-'));
+    const secretsDir = join(dir, 'data', 'mcp-manager');
+    const secretsFile = join(secretsDir, 'secrets.json');
+    const patchPath = join(dir, 'cordis.patch.yml');
+    await mkdir(secretsDir, { recursive: true });
+    await writeFile(patchPath, '- id: ui-theme\n  config: {}\n', 'utf8');
+
+    /** A context complete enough for `apply` plus a warning sink. */
+    const makeCtx = () => {
+      const warnings = [];
+      const routes = [];
+      const disposers = [];
+      const ctx = {
+        configEditor: { documentPath: patchPath, entries: () => [], configuration: () => [] },
+        pluginManager: { listPlugins: async () => [] },
+        tools: { schemas: () => [] },
+        subprocess: {},
+        connection: { requestRejection: () => undefined },
+        webServer: { register: (route) => { routes.push(route); return () => {}; } },
+        effect(fn) {
+          const dispose = fn();
+          disposers.push(dispose);
+          return dispose;
+        },
+        logger: { warn: (message) => warnings.push(message) },
+      };
+      return { ctx, warnings, routes, disposers };
+    };
+
+    try {
+      resetEnvBridge();
+      const missing = applyEnvBridge(makeCtx().ctx);
+      check(
+        'a missing secrets.json is a no-op',
+        missing.exists === false && missing.error === null && missing.configured.length === 0 && missing.injected.length === 0 && missing.skipped.length === 0,
+        JSON.stringify(missing),
+      );
+      check('the bridge reports the path it reads', missing.file === secretsFile, missing.file);
+
+      await writeFile(secretsFile, JSON.stringify({ ENVB_ALPHA: 'alpha-value-1', ENVB_BETA: 'beta-value-2' }), 'utf8');
+      const normal = applyEnvBridge(makeCtx().ctx);
+      check('every valid entry is configured', JSON.stringify(normal.configured) === JSON.stringify(['ENVB_ALPHA', 'ENVB_BETA']), JSON.stringify(normal.configured));
+      check(
+        'missing variables are injected into process.env',
+        JSON.stringify(normal.injected) === JSON.stringify(['ENVB_ALPHA', 'ENVB_BETA']) && process.env.ENVB_ALPHA === 'alpha-value-1' && process.env.ENVB_BETA === 'beta-value-2',
+      );
+      check('the bridge result carries no secret value', !JSON.stringify(normal).includes('alpha-value-1') && !JSON.stringify(normal).includes('beta-value-2'));
+      check('the last bridge result is exposed as module state', envBridgeSnapshot() === normal);
+      delete process.env.ENVB_ALPHA;
+      delete process.env.ENVB_BETA;
+
+      process.env.ENVB_EXISTING = 'host-value';
+      await writeFile(secretsFile, JSON.stringify({ ENVB_EXISTING: 'file-value' }), 'utf8');
+      const existing = applyEnvBridge(makeCtx().ctx);
+      check('an existing variable is never overwritten', process.env.ENVB_EXISTING === 'host-value' && !existing.injected.includes('ENVB_EXISTING'));
+      check(
+        'a pre-existing variable is reported as already-set',
+        existing.skipped.some((entry) => entry.key === 'ENVB_EXISTING' && entry.reason === 'already-set'),
+        JSON.stringify(existing.skipped),
+      );
+      check('an already-set variable is still listed as configured', existing.configured.includes('ENVB_EXISTING'));
+      delete process.env.ENVB_EXISTING;
+
+      await writeFile(
+        secretsFile,
+        JSON.stringify({ 'BAD-KEY': 'x', GOOD_KEY: 'good-value', EMPTY: '', NUMBER: 5, NOTHING: null, SPACES: '   ' }),
+        'utf8',
+      );
+      const invalidHost = makeCtx();
+      const invalid = applyEnvBridge(invalidHost.ctx);
+      const reasons = new Map(invalid.skipped.map((entry) => [entry.key, entry.reason]));
+      check('an invalid key name is skipped and reported', reasons.get('BAD-KEY') === 'invalid-key');
+      check(
+        'empty, whitespace, and non-string values are skipped',
+        reasons.get('EMPTY') === 'invalid-value' && reasons.get('SPACES') === 'invalid-value' && reasons.get('NUMBER') === 'invalid-value' && reasons.get('NOTHING') === 'invalid-value',
+      );
+      check('valid entries next to invalid ones are still injected', invalid.injected.includes('GOOD_KEY') && process.env.GOOD_KEY === 'good-value');
+      check('the result carries no value from the file', !JSON.stringify(invalid).includes('good-value'));
+      check('skipped entries are warned about by name only', invalidHost.warnings.some((message) => message.includes('BAD-KEY') && !message.includes('good-value')));
+      delete process.env.GOOD_KEY;
+
+      await writeFile(secretsFile, '{ this is not json', 'utf8');
+      const badHost = makeCtx();
+      const bad = applyEnvBridge(badHost.ctx);
+      check('bad JSON is reported, not thrown', bad.exists === true && typeof bad.error === 'string' && bad.error.includes('not valid JSON'));
+      check('bad JSON injects nothing', bad.injected.length === 0 && bad.configured.length === 0);
+      check('bad JSON warns exactly once', badHost.warnings.length === 1, String(badHost.warnings.length));
+      check('the warning quotes no file content', !badHost.warnings.join('\n').includes('this is not json'), badHost.warnings.join(' | '));
+
+      await writeFile(secretsFile, JSON.stringify(['not', 'an', 'object']), 'utf8');
+      const arrayResult = applyEnvBridge(makeCtx().ctx);
+      check('a non-object secrets file is rejected', typeof arrayResult.error === 'string' && arrayResult.injected.length === 0 && arrayResult.error.includes('JSON object'));
+
+      // End to end: apply() runs the bridge synchronously before registering routes,
+      // and neither the /servers response nor the diagnostics snapshot may carry values.
+      const secretValue = 'super-secret-token-value';
+      await writeFile(secretsFile, JSON.stringify({ ENVB_SMOKE_TOKEN: secretValue }), 'utf8');
+      delete process.env.ENVB_SMOKE_TOKEN;
+      const host = makeCtx();
+      const returned = apply(host.ctx);
+      check('apply returns synchronously (the bridge never blocks it)', returned === undefined);
+      check('apply injects the variable before any route exists', process.env.ENVB_SMOKE_TOKEN === secretValue);
+      check('module state exposes only the key name', envBridgeSnapshot()?.injected.includes('ENVB_SMOKE_TOKEN') === true && !JSON.stringify(envBridgeSnapshot()).includes(secretValue));
+
+      const serversRoute = host.routes.find((route) => route.path === '/mcp-manager/api/servers');
+      check('apply still registers the servers route', serversRoute !== undefined);
+      const serversResponse = mockResponse();
+      await serversRoute.handler({ method: 'GET', headers: {} }, serversResponse);
+      const serversBody = JSON.parse(serversResponse.body);
+      check(
+        'GET /servers reports the env bridge state',
+        serversResponse.statusCode === 200 &&
+          serversBody.envBridge !== null &&
+          serversBody.envBridge.file === secretsFile &&
+          serversBody.envBridge.injected.includes('ENVB_SMOKE_TOKEN'),
+        JSON.stringify(serversBody.envBridge),
+      );
+      check('GET /servers never contains the secret value', !serversResponse.body.includes(secretValue));
+
+      const snapshotPath = await captureSnapshot(host.ctx, { profileDir: dir });
+      const snapshotText = await readFile(snapshotPath, 'utf8');
+      const snapshot = JSON.parse(snapshotText);
+      check('the diagnostics snapshot records the bridge state', snapshot.backend?.envBridge?.injected?.includes('ENVB_SMOKE_TOKEN') === true);
+      check('the diagnostics snapshot never contains the secret value', !snapshotText.includes(secretValue));
+
+      for (const dispose of host.disposers) {
+        try {
+          dispose?.();
+        } catch {
+          /* disposal must not fail the test */
+        }
+      }
+      delete process.env.ENVB_SMOKE_TOKEN;
+    } finally {
+      delete process.env.ENVB_ALPHA;
+      delete process.env.ENVB_BETA;
+      delete process.env.ENVB_EXISTING;
+      delete process.env.GOOD_KEY;
+      delete process.env.ENVB_SMOKE_TOKEN;
+      await rm(dir, { recursive: true, force: true });
+    }
+  }
+
+  // ------------- Q. unified project trust (契约 §1) + global MCP precedence (契约 §2)
+  section('Q. unified project trust + global MCP precedence');
+  {
+    const dir = await mkdtemp(join(tmpdir(), 'mcp-manager-trust-'));
+    const profile = join(dir, 'profile');
+    const project = join(dir, 'project');
+    const mcpFile = join(project, '.dsh', 'mcp.json');
+    const pluginsFile = join(project, '.dsh', 'plugins.json');
+    const mcpText = '{"mcpServers":{"demo":{"transport":"stdio","command":"demo"}}}\n';
+    const pluginsText = '{"enabledPlugins":{"demo-plugin":true}}\n';
+    const projectHash = (text) => createHash('sha256').update(Buffer.from(text, 'utf8')).digest('hex');
+
+    try {
+      await mkdir(join(project, '.dsh'), { recursive: true });
+      await writeFile(mcpFile, mcpText, 'utf8');
+      await writeFile(pluginsFile, pluginsText, 'utf8');
+      const mcpHash = projectHash(mcpText);
+      const pluginsHash = projectHash(pluginsText);
+
+      // -------------------------------------------------- 聚合 hash 向量
+      check(
+        '契约 §1.3 空项目聚合 hash 向量逐字节一致',
+        aggregateHash(null, null) === '63ec3eb212c5b2dd706c7b5faeece6476df07d5666b82583fb140723ad70049f',
+        aggregateHash(null, null),
+      );
+      check(
+        'canonical 文本逐字节照契约（空项目）',
+        canonicalTrustText(null, null) === 'dsh-project-trust/v1\nmcp:-\nplugins:-',
+        JSON.stringify(canonicalTrustText(null, null)),
+      );
+      check('canonical 文本逐字节照契约（只有 mcp）', canonicalTrustText(mcpHash, null) === `dsh-project-trust/v1\nmcp:${mcpHash}\nplugins:-`);
+      check('canonical 文本逐字节照契约（只有 plugins）', canonicalTrustText(null, pluginsHash) === `dsh-project-trust/v1\nmcp:-\nplugins:${pluginsHash}`);
+      check(
+        'canonical 文本两段顺序固定（mcp 在前）',
+        canonicalTrustText(mcpHash, pluginsHash) === `dsh-project-trust/v1\nmcp:${mcpHash}\nplugins:${pluginsHash}`,
+        JSON.stringify(canonicalTrustText(mcpHash, pluginsHash)),
+      );
+      check(
+        '聚合 hash = sha256(canonical, utf8) 的 hex',
+        aggregateHash(mcpHash, pluginsHash) ===
+          createHash('sha256')
+            .update(`dsh-project-trust/v1\nmcp:${mcpHash}\nplugins:${pluginsHash}`, 'utf8')
+            .digest('hex'),
+      );
+      check('两份文件换位会得到不同聚合 hash（顺序不可交换）', aggregateHash(mcpHash, pluginsHash) !== aggregateHash(pluginsHash, mcpHash));
+      check('聚合 hash 与 project.js 的 hashBytes 口径一致', hashBytes(Buffer.from(`dsh-project-trust/v1\nmcp:${mcpHash}\nplugins:${pluginsHash}`, 'utf8')) === aggregateHash(mcpHash, pluginsHash));
+      check('信任键按契约规范化（反斜杠/末尾斜杠/Windows 小写）', normalizeTrustKey(project) === normalizeTrustKey(`${project}${process.platform === 'win32' ? '' : ''}`) && !normalizeTrustKey(project).includes('\\') && !normalizeTrustKey(project).endsWith('/'));
+      check('锁文件固定为 <store>.lock', trustLockPathFor(profile) === `${trustStorePathFor(profile)}.lock`, trustLockPathFor(profile));
+      check('存储路径为 <profile>/data/project-trust/trusted.json', trustStorePathFor(profile) === join(profile, 'data', 'project-trust', 'trusted.json'));
+
+      // -------------------------------------------------- 批准前
+      const initial = await trustStateFor(profile, project);
+      check(
+        '未批准时两层都是 untrusted、source=none',
+        initial.shared === false && initial.mcp === 'untrusted' && initial.plugins === 'untrusted' && initial.source === 'none',
+        JSON.stringify({ mcp: initial.mcp, plugins: initial.plugins, source: initial.source }),
+      );
+      check('files 记录两份文件的字节 sha256', initial.files.mcp === mcpHash && initial.files.plugins === pluginsHash);
+      check('聚合 hash 由当前两份文件算出', initial.hash === aggregateHash(mcpHash, pluginsHash));
+
+      // -------------------------------------------------- 批准 + 读写
+      const approved = await approveProject(profile, project);
+      const storeText = await readFile(trustStorePathFor(profile), 'utf8');
+      const store = JSON.parse(storeText);
+      const key = normalizeTrustKey(project);
+      check('approveProject 写入 canonical 存储', store.version === 1 && typeof store.projects === 'object' && store.projects[key] !== undefined);
+      check(
+        '记录形状为 { hash, files: { mcp, plugins }, approvedAt }',
+        store.projects[key].hash === approved.hash && store.projects[key].files.mcp === mcpHash && store.projects[key].files.plugins === pluginsHash && typeof store.projects[key].approvedAt === 'string',
+        JSON.stringify(store.projects[key]),
+      );
+      check('批准后没有残留锁文件', !existsSync(trustLockPathFor(profile)));
+      const shared = await trustStateFor(profile, project);
+      check('批准后 shared=true、两层都 trusted', shared.shared === true && shared.mcp === 'trusted' && shared.plugins === 'trusted' && shared.source === 'shared');
+      check('客户端只需要的四层字段都在', JSON.stringify(Object.keys({ mcp: shared.mcp, plugins: shared.plugins, shared: shared.shared, source: shared.source })) === JSON.stringify(['mcp', 'plugins', 'shared', 'source']));
+
+      // 任一份文件变化 → 重新批准
+      await writeFile(pluginsFile, '{"enabledPlugins":{"demo-plugin":false}}\n', 'utf8');
+      const changed = await trustStateFor(profile, project);
+      check('plugins.json 变化后 shared=false、两层回到未信任', changed.shared === false && changed.mcp === 'untrusted' && changed.plugins === 'untrusted' && changed.source === 'none');
+      await approveProject(profile, project);
+      check('重新批准后恢复 shared', (await trustStateFor(profile, project)).shared === true);
+
+      // 只有一个文件时，另一层是「不适用」
+      const mcpOnly = join(dir, 'mcp-only');
+      await mkdir(join(mcpOnly, '.dsh'), { recursive: true });
+      await writeFile(join(mcpOnly, '.dsh', 'mcp.json'), mcpText, 'utf8');
+      await approveProject(profile, mcpOnly);
+      const mcpOnlyState = await trustStateFor(profile, mcpOnly);
+      check(
+        '缺失的 plugins.json 是 not-applicable（契约 §1.6）',
+        mcpOnlyState.mcp === 'trusted' && mcpOnlyState.plugins === 'not-applicable' && mcpOnlyState.shared === true,
+        JSON.stringify({ mcp: mcpOnlyState.mcp, plugins: mcpOnlyState.plugins }),
+      );
+
+      // 读-合并-写：批准另一个项目不能丢掉已有记录
+      const second = join(dir, 'second');
+      await mkdir(join(second, '.dsh'), { recursive: true });
+      await writeFile(join(second, '.dsh', 'mcp.json'), mcpText, 'utf8');
+      await approveProject(profile, second);
+      const merged = JSON.parse(await readFile(trustStorePathFor(profile), 'utf8'));
+      check('批准新项目保留其它项目记录', merged.projects[key] !== undefined && merged.projects[normalizeTrustKey(second)] !== undefined && merged.projects[normalizeTrustKey(mcpOnly)] !== undefined, Object.keys(merged.projects).join(','));
+
+      // -------------------------------------------------- 旧记录只读回退
+      const legacyProfile = join(dir, 'legacy-profile');
+      const legacyProject = join(dir, 'legacy-project');
+      await mkdir(join(legacyProject, '.dsh'), { recursive: true });
+      await writeFile(join(legacyProject, '.dsh', 'mcp.json'), mcpText, 'utf8');
+      await writeFile(join(legacyProject, '.dsh', 'plugins.json'), pluginsText, 'utf8');
+      await mkdir(join(legacyProfile, 'data', 'mcp-manager'), { recursive: true });
+      await mkdir(join(legacyProfile, 'data', 'plugin-hub'), { recursive: true });
+      await writeFile(
+        join(legacyProfile, 'data', 'mcp-manager', 'trusted-projects.json'),
+        `${JSON.stringify({ version: 1, projects: { [legacyProject]: { hash: mcpHash, at: new Date().toISOString() } } }, null, 2)}\n`,
+        'utf8',
+      );
+      await writeFile(
+        join(legacyProfile, 'data', 'plugin-hub', 'trusted.json'),
+        `${JSON.stringify({ version: 1, projects: { [normalizeTrustKey(legacyProject)]: { hash: pluginsHash, approvedAt: new Date().toISOString() } } }, null, 2)}\n`,
+        'utf8',
+      );
+
+      const legacy = await trustStateFor(legacyProfile, legacyProject);
+      check('没有 canonical 时旧记录仍生效（mcp 层）', legacy.shared === false && legacy.mcp === 'trusted' && legacy.legacy.mcp === true);
+      check('没有 canonical 时旧 hub 记录仍生效（插件层）', legacy.plugins === 'trusted' && legacy.legacy.plugins === true && legacy.source === 'legacy');
+
+      const legacyTrust = await readTrust(legacyProfile);
+      check('readTrust 导出保持旧记录形状（key = 原始绝对路径）', legacyTrust[legacyProject]?.hash === mcpHash && typeof legacyTrust[legacyProject]?.at === 'string');
+      check('isProjectTrusted 保持旧签名，只判断旧记录这一层', isProjectTrusted(legacyTrust, legacyProject, mcpHash) === true && isProjectTrusted(legacyTrust, legacyProject, 'deadbeef') === false);
+
+      // 旧记录内容变化 → 对应层失效（另一层不受影响）
+      await writeFile(join(legacyProject, '.dsh', 'mcp.json'), '{"mcpServers":{}}\n', 'utf8');
+      const legacyDrift = await trustStateFor(legacyProfile, legacyProject);
+      check('mcp 文件变化后旧 mcp-manager 记录失效，插件层仍由旧 hub 记录回退', legacyDrift.mcp === 'untrusted' && legacyDrift.plugins === 'trusted');
+
+      // 点一次信任 → 整体升级为 canonical；撤销删自己的旧记录、不动 hub 的旧记录
+      await writeFile(join(legacyProject, '.dsh', 'mcp.json'), mcpText, 'utf8');
+      await trustProject(legacyProfile, legacyProject);
+      const upgraded = await trustStateFor(legacyProfile, legacyProject);
+      check('点一次「信任」后整体升级为 canonical', upgraded.shared === true && upgraded.source === 'shared');
+      const revoked = await revokeProject(legacyProfile, legacyProject);
+      const afterRevoke = await trustStateFor(legacyProfile, legacyProject);
+      check('撤销删除 canonical 记录并尽力删掉自己的旧记录', revoked.removed === true && revoked.legacyRemoved === true && afterRevoke.shared === false && afterRevoke.mcp === 'untrusted' && afterRevoke.legacy.mcp === false);
+      check('撤销不动旧 hub 记录（插件层仍可回退）', afterRevoke.plugins === 'trusted' && afterRevoke.source === 'legacy');
+
+      // -------------------------------------------------- 全局同名 → 项目跳过
+      const runtimeProfile = join(dir, 'runtime-profile');
+      const runtimeProject = join(dir, 'runtime-project');
+      const runtimeMcp = join(runtimeProject, '.dsh', 'mcp.json');
+      const patchPath = join(runtimeProfile, 'cordis.patch.yml');
+      await mkdir(join(runtimeProject, '.dsh'), { recursive: true });
+      await mkdir(runtimeProfile, { recursive: true });
+      await writeFile(patchPath, '- id: ui-theme\n  config: {}\n', 'utf8');
+      const serversOf = (extra = {}) => ({
+        mcpServers: {
+          demo: { transport: 'stdio', command: 'demo-cmd' },
+          alpha: { transport: 'stdio', command: 'alpha-cmd' },
+          off: { transport: 'stdio', command: 'off-cmd' },
+          keep: { transport: 'stdio', command: 'keep-cmd' },
+          ...extra,
+        },
+        disabled: ['off'],
+      });
+      await writeFile(runtimeMcp, `${JSON.stringify(serversOf(), null, 2)}\n`, 'utf8');
+      await approveProject(runtimeProfile, runtimeProject);
+
+      const mounted = [];
+      const warnings = [];
+      const handlers = {};
+      const fakePlugin = { inject: ['tools'], apply() {} };
+      const runtimeCtx = {
+        configEditor: { documentPath: patchPath },
+        pluginManager: {
+          listPlugins: async () => [
+            { patchId: 'mcp-client-demo', moduleName: MCP_CLIENT_PACKAGE, enabled: true, fiberPhase: 'active' },
+            { patchId: 'mcp-client-off', moduleName: MCP_CLIENT_PACKAGE, enabled: false, fiberPhase: 'pending' },
+          ],
+        },
+        tools: { schemas: () => ['mcp__alpha__one', 'mcp__unrelated__two', 'filesystem__read'] },
+        workingDirectory: { get: () => runtimeProject },
+        loader: { import: async () => ({ default: fakePlugin }) },
+        on(event, handler) {
+          handlers[event] = handler;
+          return () => {};
+        },
+      };
+      const agent = {
+        session: { id: 'sess-1' },
+        ctx: {
+          plugin(_plugin, config) {
+            mounted.push(config);
+            return () => {};
+          },
+        },
+      };
+      const originalWarn = console.warn;
+      console.warn = (...args) => warnings.push(args.join(' '));
+      let disposeRuntime = null;
+      // runtime 快照只在 Agent 挂着时存在，所以要在卸载前读一次 payload。
+      let view = null;
+      try {
+        resetProjectRuntime();
+        disposeRuntime = mountProjectRuntime(runtimeCtx);
+        // `agent/created` 的 handler 不返回 promise；用 `agent/pre-step`（会 await 队列）等它落定。
+        handlers['agent/created']({ agent });
+        await handlers['agent/pre-step']({ agent }, async () => {});
+
+        const session = projectRuntimeSnapshot().sessions.find((item) => item.sessionId === 'sess-1');
+        check('全局同名的项目服务器被跳过并记录到 skipped', session !== undefined && JSON.stringify(session.skipped) === JSON.stringify(['demo', 'alpha']), JSON.stringify(session?.skipped));
+        check('只挂载未被全局占用且启用的项目服务器', JSON.stringify(mounted.map((config) => config.serverName)) === JSON.stringify(['keep']), JSON.stringify(mounted.map((config) => config.serverName)));
+        check('停用的同名条目不算 skipped', session !== undefined && !session.skipped.includes('off'));
+        check('tools.schemas 兜底也能判定同名（不依赖 patch 行）', isShadowedByGlobal('alpha', await globalMcpOccupancy(runtimeCtx)) === true && isShadowedByGlobal('keep', await globalMcpOccupancy(runtimeCtx)) === false);
+        check('停用的全局行不占用名字', isShadowedByGlobal('off', await globalMcpOccupancy(runtimeCtx)) === false);
+
+        const skipWarnings = () => warnings.filter((message) => message.includes('global wins'));
+        check('同名跳过每个名字只 warn 一次', skipWarnings().length === 2, String(skipWarnings().length));
+
+        // 项目文件变了并重新批准 → 走到一次真正的 reconcile，仍然不该重复 warn。
+        await writeFile(runtimeMcp, `${JSON.stringify(serversOf({ extra: { transport: 'stdio', command: 'extra-cmd' } }), null, 2)}\n`, 'utf8');
+        await approveProject(runtimeProfile, runtimeProject);
+        await handlers['agent/pre-step']({ agent }, async () => {});
+        check('再次 reconcile 不会重复 warn', skipWarnings().length === 2, String(skipWarnings().length));
+        check(
+          '重新 reconcile 后 skipped 仍然准确',
+          JSON.stringify(projectRuntimeSnapshot().sessions.find((item) => item.sessionId === 'sess-1')?.skipped) === JSON.stringify(['demo', 'alpha']),
+        );
+        view = await projectView(runtimeCtx, runtimeProject);
+
+        // 手动重连：有活跃会话时必须真重挂，并逐条报告挂载失败。
+        const agentCtx = {
+          ...runtimeCtx,
+          get(name) {
+            return name === 'agents' ? { list: () => [agent] } : undefined;
+          },
+        };
+        const beforeRemount = mounted.length;
+        const remount = await remountProjectServer(agentCtx, runtimeProject, 'keep');
+        check(
+          '项目重连对有活跃会话的项目真重挂并列出服务器',
+          remount.remounted === 1 &&
+            remount.remountedServers.includes('keep') &&
+            remount.failed.length === 0 &&
+            mounted.length > beforeRemount,
+          JSON.stringify({ remounted: remount.remounted, servers: remount.remountedServers, failed: remount.failed }),
+        );
+        const failingAgent = {
+          session: { id: 'sess-1' },
+          ctx: {
+            plugin() {
+              throw new Error('boom: cannot mount');
+            },
+          },
+        };
+        const failingRemount = await remountProjectServer(
+          {
+            ...agentCtx,
+            get(name) {
+              return name === 'agents' ? { list: () => [failingAgent] } : undefined;
+            },
+          },
+          runtimeProject,
+          'keep',
+        );
+        check(
+          '项目重连把挂载失败逐条报告，而不是假装成功',
+          failingRemount.remounted === 1 &&
+            failingRemount.failed.some((item) => item.serverName === 'keep' && item.error.includes('boom')),
+          JSON.stringify(failingRemount.failed),
+        );
+      } finally {
+        if (disposeRuntime !== null) disposeRuntime();
+        console.warn = originalWarn;
+        resetProjectRuntime();
+      }
+
+      // -------------------------------------------------- 路由 payload
+      check('GET /project 的 skipped 列表', JSON.stringify(view.skipped) === JSON.stringify(['demo', 'alpha']), JSON.stringify(view.skipped));
+      check(
+        'problems 文案改为「不会挂载（全局优先）」',
+        view.problems.some((problem) => problem.serverName === 'demo' && problem.message.includes('不会挂载') && problem.message.includes('全局优先')),
+        JSON.stringify(view.problems.map((problem) => problem.message)),
+      );
+      check(
+        'payload 带 trustLayers: { mcp, plugins, shared, source }',
+        view.trustLayers.mcp === 'trusted' && view.trustLayers.plugins === 'not-applicable' && view.trustLayers.shared === true && view.trustLayers.source === 'shared',
+        JSON.stringify(view.trustLayers),
+      );
+      check('同名的行带 skipped 标记、正常的行不带', view.servers.find((row) => row.serverName === 'demo')?.skipped === true && view.servers.find((row) => row.serverName === 'keep')?.skipped === false);
+      check('payload 的 runtime 暴露 skipped', view.runtime.some((item) => item.sessionId === 'sess-1' && JSON.stringify(item.skipped) === JSON.stringify(['demo', 'alpha'])));
+
+      // 两份文件都不存在时，批准请求被拒绝而不是写空记录
+      const emptyProject = join(dir, 'empty-project');
+      await mkdir(emptyProject, { recursive: true });
+      let rejected = null;
+      try {
+        await trustProjectScope(runtimeCtx, emptyProject);
+      } catch (error) {
+        rejected = error;
+      }
+      check('没有任何配置文件时拒绝批准', rejected !== null && rejected.code === 'conflict', String(rejected?.message ?? ''));
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  }
+
+  // ------------------- R. health derivation / schema budget / probe stages
+  section('R. connection health, schema budget, probe stages');
+  {
+    resetHealth();
+    const T0 = 1_700_000_000_000;
+
+    const off = healthOf({ enabled: false, fiberPhase: 'active', toolCount: 0 }, { key: 'r-off', now: T0 });
+    check('disabled is stopped', off.state === 'stopped' && off.reason === 'disabled', JSON.stringify(off));
+    const uncomposed = healthOf({ enabled: true, fiberPhase: null, toolCount: 0 }, { key: 'r-none', now: T0 });
+    check('no fiber is stopped, not failed', uncomposed.state === 'stopped' && uncomposed.reason === 'not-loaded', JSON.stringify(uncomposed));
+    const broken = healthOf(
+      { enabled: true, fiberPhase: 'failed', toolCount: 0, diagnostic: 'mcp-client(x): boom' },
+      { key: 'r-broken', now: T0 },
+    );
+    check(
+      'a failed fiber reports a code plus the host diagnostic as detail',
+      broken.state === 'failed' && broken.reason === 'fiber-failed' && broken.detail === 'mcp-client(x): boom',
+      JSON.stringify(broken),
+    );
+    const live = healthOf({ enabled: true, fiberPhase: 'active', toolCount: 2 }, { key: 'r-live', now: T0 });
+    check('active with tools is connected', live.state === 'connected' && live.reason === null, JSON.stringify(live));
+
+    const starting = healthOf({ enabled: true, fiberPhase: 'active', toolCount: 0 }, { key: 'r-start', now: T0 });
+    const waiting = healthOf({ enabled: true, fiberPhase: 'active', toolCount: 0 }, { key: 'r-start', now: T0 + 4000 });
+    const gaveUp = healthOf({ enabled: true, fiberPhase: 'active', toolCount: 0 }, { key: 'r-start', now: T0 + 6000 });
+    const stillGaveUp = healthOf({ enabled: true, fiberPhase: 'active', toolCount: 0 }, { key: 'r-start', now: T0 + 9000 });
+    check('active with no tools is connecting inside the grace window', starting.state === 'connecting' && waiting.state === 'connecting');
+    check('the grace window is measured from the first observation', gaveUp.state === 'failed' && gaveUp.reason === 'no-tools', JSON.stringify(gaveUp));
+    check(
+      'a later refresh does not restart the grace window',
+      stillGaveUp.state === 'failed' && stillGaveUp.since === gaveUp.since,
+      JSON.stringify(stillGaveUp),
+    );
+    check('since is stable while the state is', starting.since === waiting.since && gaveUp.since !== starting.since);
+
+    const unknownRegistry = healthOf(
+      { enabled: true, fiberPhase: 'active', toolCount: 0, toolCountKnown: false },
+      { key: 'r-unknown', now: T0 + 600_000 },
+    );
+    check(
+      'an unavailable tool registry is connecting, never failed',
+      unknownRegistry.state === 'connecting' && unknownRegistry.reason === 'registry-unavailable',
+      JSON.stringify(unknownRegistry),
+    );
+
+    const emptyButReachable = healthOf(
+      { enabled: true, fiberPhase: 'active', toolCount: 0, lastProbe: { ok: true, at: new Date(T0 + 600_000).toISOString() } },
+      { key: 'r-zero', now: T0 + 600_000 },
+    );
+    check('a fresh successful probe proves a legal zero-tool server', emptyButReachable.state === 'connected', JSON.stringify(emptyButReachable));
+
+    // 关键回归：编辑后（曾有过工具、现在 0 工具）旧的探测成功不能把行钉在 connected。
+    resetHealth();
+    healthOf({ enabled: true, fiberPhase: 'active', toolCount: 2 }, { key: 'r-stale', now: T0 });
+    const staleWindow = healthOf(
+      { enabled: true, fiberPhase: 'active', toolCount: 0, lastProbe: { ok: true, at: new Date(T0 - 60_000).toISOString() } },
+      { key: 'r-stale', now: T0 + 6000 },
+    );
+    const staleSuccess = healthOf(
+      { enabled: true, fiberPhase: 'active', toolCount: 0, lastProbe: { ok: true, at: new Date(T0 - 60_000).toISOString() } },
+      { key: 'r-stale', now: T0 + 12_000 },
+    );
+    check('losing the tools starts a fresh grace window', staleWindow.state === 'connecting', JSON.stringify(staleWindow));
+    check(
+      'a success older than the last tool sighting does not mask a broken row',
+      staleSuccess.state === 'failed' && staleSuccess.reason === 'no-tools',
+      JSON.stringify(staleSuccess),
+    );
+    const freshSuccess = healthOf(
+      { enabled: true, fiberPhase: 'active', toolCount: 0, lastProbe: { ok: true, at: new Date(T0 + 13_000).toISOString() } },
+      { key: 'r-stale', now: T0 + 13_000 },
+    );
+    check('a success newer than the last tool sighting closes the row as connected', freshSuccess.state === 'connected', JSON.stringify(freshSuccess));
+
+    resetHealth();
+    healthOf({ enabled: true, fiberPhase: 'active', toolCount: 1 }, { key: 'keep-me', now: T0 });
+    healthOf({ enabled: true, fiberPhase: 'active', toolCount: 1 }, { key: 'drop-me', now: T0 });
+    pruneHealth(['keep-me']);
+    check('pruning drops rows that left the list', healthEntryCount() === 1, String(healthEntryCount()));
+
+    const oversized = {
+      type: 'object',
+      properties: Object.fromEntries(
+        Array.from({ length: 60 }, (_, index) => [`p${index}`, { type: 'string', description: 'x'.repeat(600) }]),
+      ),
+    };
+    const boundTools = normalizeTools([{ name: 'wide', description: 'd', inputSchema: oversized }]);
+    check(
+      'an oversized schema is degraded, not dropped',
+      boundTools[0].schemaTruncated === true && boundTools[0].inputSchema !== null && boundTools[0].schemaBytes > SCHEMA_MAX_BYTES,
+      JSON.stringify({ bytes: boundTools[0].schemaBytes, truncated: boundTools[0].schemaTruncated }),
+    );
+    check(
+      'the degraded schema stays under the cap and keeps property names',
+      Buffer.byteLength(JSON.stringify(boundTools[0].inputSchema), 'utf8') <= SCHEMA_MAX_BYTES &&
+        boundTools[0].inputSchema.properties.p0 !== undefined,
+    );
+
+    const small = normalizeTools([
+      { name: 'narrow', inputSchema: { type: 'object', properties: { q: { type: 'string', enum: ['a', 'b'] } }, required: ['q'] } },
+    ]);
+    check(
+      'a small schema passes through with required/enum intact',
+      small[0].schemaTruncated === false &&
+        small[0].required[0] === 'q' &&
+        small[0].inputSchema.properties.q.enum[1] === 'b' &&
+        small[0].estimatedTokens === Math.max(1, Math.round(small[0].schemaBytes / 4)),
+    );
+
+    const many = normalizeTools(
+      Array.from({ length: 20 }, (_, index) => ({
+        name: `tool${index}`,
+        inputSchema: { type: 'object', properties: { s: { type: 'string', description: 'y'.repeat(20_000) } } },
+      })),
+      { schemaBudget: 64 * 1024 },
+    );
+    check(
+      'a probe-wide budget omits the schemas beyond it',
+      many.some((tool) => tool.schemaOmitted === true) && many.some((tool) => tool.inputSchema !== null),
+      `${many.filter((tool) => tool.schemaOmitted).length}/${many.length} omitted`,
+    );
+
+    rememberProbe('wide', { ok: true, durationMs: 1, stage: 'ok', tools: boundTools });
+    const cached = lastProbeOf('wide');
+    check(
+      'lastProbe keeps size facts, not schema bodies',
+      cached.tools[0].inputSchema === undefined && cached.tools[0].schemaBytes > 0 && cached.tools[0].estimatedTokens > 0,
+      JSON.stringify(cached.tools[0]),
+    );
+    check('lastProbe keeps the probe stage', cached.stage === 'ok');
+
+    const targetA = probeTargetFingerprint({ transport: 'stdio', command: 'a', args: ['b'] });
+    const targetB = probeTargetFingerprint({ transport: 'stdio', command: 'a', args: ['c'] });
+    rememberProbe('fingerprint', { ok: true, durationMs: 1, tools: [] }, targetA);
+    check(
+      'a cached probe is dropped when the row definition changed',
+      lastProbeOf('fingerprint', targetA) !== null && lastProbeOf('fingerprint', targetB) === null,
+    );
+    check(
+      'the fingerprint ignores credentials and distinguishes transports',
+      probeTargetFingerprint({ transport: 'streamable-http', url: 'https://x/mcp' }) ===
+        probeTargetFingerprint({ transport: 'streamable-http', url: 'https://x/mcp' }) &&
+        probeTargetFingerprint({ transport: 'stdio', command: 'npx', args: ['-y', 'pkg'] }) !==
+          probeTargetFingerprint({ transport: 'stdio', command: 'npx', args: ['-y', 'other'] }),
+    );
+
+    check(
+      'each failure stage gets its own advice',
+      hintFor('config', 'stdio').includes('command') &&
+        hintFor('spawn', 'stdio').includes('PATH') &&
+        hintFor('initialize', 'stdio').includes('handshake') &&
+        hintFor('spawn', 'streamable-http').includes('URL') &&
+        hintFor('tools-list', 'stdio').includes('tools/list') &&
+        hintFor('ok', 'stdio') === null,
+    );
+    check(
+      'unresolved references are named in the hint',
+      hintFor('spawn', 'stdio', { unresolvedKeys: ['API_KEY'] }).includes('API_KEY'),
+    );
+
+    // --- global reconnect: a Fiber restart, never a file write -----------------
+    const restarted = [];
+    const liveRow = { entryId: 'include:mcp-client-ok', patchId: 'mcp-client-ok', moduleName: MCP_CLIENT_PACKAGE, enabled: true, fiberPhase: 'active' };
+    const okEntry = {
+      id: 'include:mcp-client-ok',
+      options: { id: 'mcp-client-ok', name: MCP_CLIENT_PACKAGE, config: { serverName: 'ok' } },
+      fiber: {
+        async restart() {
+          restarted.push('ok');
+        },
+      },
+    };
+    const reconnectCtx = { configEditor: { entries: () => [okEntry] }, pluginManager: { listPlugins: async () => [liveRow] } };
+    const reconnectOutcome = await reconnectGlobalServer(reconnectCtx, { entryId: 'include:mcp-client-ok' });
+    check(
+      'a global reconnect restarts the fiber and touches no configuration',
+      reconnectOutcome.restarted === true &&
+        restarted.length === 1 &&
+        reconnectOutcome.serverName === 'ok' &&
+        reconnectOutcome.fiberPhase === 'active',
+      JSON.stringify(reconnectOutcome),
+    );
+
+    const disabledCtx = {
+      configEditor: { entries: () => [okEntry] },
+      pluginManager: { listPlugins: async () => [{ ...liveRow, enabled: false }] },
+    };
+    let disabledRefusal = null;
+    try {
+      await reconnectGlobalServer(disabledCtx, { entryId: 'include:mcp-client-ok' });
+    } catch (error) {
+      disabledRefusal = error;
+    }
+    check('reconnecting a disabled row is refused with a conflict', disabledRefusal?.code === 'conflict', String(disabledRefusal?.message ?? ''));
+
+    const fiberlessEntry = { id: 'include:mcp-client-bare', options: { id: 'mcp-client-bare', name: MCP_CLIENT_PACKAGE } };
+    let fiberlessRefusal = null;
+    try {
+      await reconnectGlobalServer(
+        { configEditor: { entries: () => [fiberlessEntry] }, pluginManager: { listPlugins: async () => [] } },
+        { patchId: 'mcp-client-bare' },
+      );
+    } catch (error) {
+      fiberlessRefusal = error;
+    }
+    check('an entry without a live fiber is not-manageable', fiberlessRefusal?.code === 'not-manageable', String(fiberlessRefusal?.message ?? ''));
+
+    resetProjectRuntime();
+    const projectRemount = await remountProjectServer(
+      { get: () => ({ list: () => [] }), workingDirectory: { get: () => '' } },
+      process.cwd(),
+      'demo',
+    );
+    check(
+      'a project reconnect with no live Session reports zero remounts',
+      projectRemount.remounted === 0 && projectRemount.reason !== null && projectRemount.scope === 'project',
+      JSON.stringify(projectRemount),
+    );
+
+    resetHealth();
+    clearProbes();
+  }
+
+  console.log(`\n${failures === 0 ? 'ALL PASS' : `${failures} FAILURE(S)`}`);
+  process.exitCode = failures === 0 ? 0 : 1;
+};
+
+main().catch((error) => {
+  console.error('SMOKE CRASHED', error);
+  process.exitCode = 1;
+});
