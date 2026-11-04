@@ -27,13 +27,19 @@ export function agentOf(scope) {
   return scope.session !== undefined ? scope : undefined
 }
 
-/** Replace or append the manifest context without duplicating it. */
-function withManifestContext(assembly, text) {
-  const contexts = Array.isArray(assembly.contexts) ? assembly.contexts : []
-  const next = contexts.filter(context => context?.name !== MANIFEST_CONTEXT)
-  if (text !== '') next.push({ name: MANIFEST_CONTEXT, text })
-  return { ...assembly, contexts: next }
-}
+  /** Replace or append the manifest context without duplicating it. */
+  function withManifestContext(assembly, text) {
+    const contexts = Array.isArray(assembly.contexts) ? assembly.contexts : []
+    const next = contexts.filter(context => context?.name !== MANIFEST_CONTEXT)
+    if (text !== '') next.push({ name: MANIFEST_CONTEXT, text })
+    return { ...assembly, contexts: next }
+  }
+
+  /** Hide the bridge tools while search is inactive (off / below threshold / nothing deferred). */
+  function withoutBridgeTools(assembly) {
+    if (!Array.isArray(assembly.tools)) return assembly
+    return { ...assembly, tools: assembly.tools.filter(tool => !BRIDGE_TOOL_NAMES.includes(tool?.name)) }
+  }
 
 /**
  * Create the engine.
@@ -123,13 +129,13 @@ export function createEngine({ ctx, config, settings }) {
     if (!Array.isArray(assembly.tools) || assembly.tools.length === 0) return assembly
     const agent = agentOf(scope)
     const mode = modeFor(agent)
-    if (mode === 'off') return withManifestContext(assembly, '')
+    if (mode === 'off') return withManifestContext(withoutBridgeTools(assembly), '')
     // A strict PTC scope collapses the table to the `run_code` transport.
     if (assembly.tools.length === 1 && assembly.tools[0]?.name === 'run_code') return assembly
-    if (mode === 'auto' && assembly.tools.length < config.minTools) return withManifestContext(assembly, '')
+    if (mode === 'auto' && assembly.tools.length < config.minTools) return withManifestContext(withoutBridgeTools(assembly), '')
     const eager = eagerNames(agent, assembly.tools)
     const { eager: eagerTools, deferred } = splitCatalog(assembly.tools, eager)
-    if (deferred.length === 0) return withManifestContext(assembly, '')
+    if (deferred.length === 0) return withManifestContext(withoutBridgeTools(assembly), '')
     // The bridge is registered before any assembly, so it is normally part of the
     // catalog; append a minimal schema if another layer hid it.
     const present = new Set(eagerTools.map(tool => tool.name))

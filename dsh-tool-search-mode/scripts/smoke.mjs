@@ -187,7 +187,8 @@ await check('off mode keeps the full table and drops a stale manifest', () => {
   const input = assemblyOf(CATALOG)
   input.contexts.push({ name: MANIFEST_CONTEXT, text: 'stale' })
   const result = engine.assemble(input, agent('s2'), undefined)
-  assert.equal(result.tools.length, CATALOG.length)
+  assert.equal(result.tools.length, CATALOG.length - BRIDGE_TOOL_NAMES.length)
+  assert.equal(result.tools.some(item => BRIDGE_TOOL_NAMES.includes(item.name)), false)
   assert.equal(result.contexts.some(item => item.name === MANIFEST_CONTEXT), false)
 })
 
@@ -195,7 +196,9 @@ await check('auto mode stays off below minTools and activates above it', () => {
   const { ctx } = fakeCtx(CATALOG)
   const settings = createSettingsStore({ dshHome: TEST_HOME, initialMode: 'auto' })
   const small = createEngine({ ctx, config: resolveConfig({ mode: 'auto', core: ['read'], minTools: 20 }), settings })
-  assert.equal(small.assemble(assemblyOf(CATALOG), agent('s3'), undefined).tools.length, CATALOG.length)
+  const inactive = small.assemble(assemblyOf(CATALOG), agent('s3'), undefined)
+  assert.equal(inactive.tools.length, CATALOG.length - BRIDGE_TOOL_NAMES.length)
+  assert.equal(inactive.tools.some(item => BRIDGE_TOOL_NAMES.includes(item.name)), false)
   const large = createEngine({ ctx, config: resolveConfig({ mode: 'auto', core: ['read'], minTools: 3 }), settings })
   assert.ok(large.assemble(assemblyOf(CATALOG), agent('s4'), undefined).tools.length < CATALOG.length)
 })
@@ -207,7 +210,7 @@ await check('a session captures its mode; new sessions read the current setting'
   assert.ok(engine.assemble(assemblyOf(CATALOG), agent('s5'), undefined).tools.length < CATALOG.length)
   settings.set('off')
   assert.ok(engine.assemble(assemblyOf(CATALOG), agent('s5'), undefined).tools.length < CATALOG.length)
-  assert.equal(engine.assemble(assemblyOf(CATALOG), agent('s6'), undefined).tools.length, CATALOG.length)
+  assert.equal(engine.assemble(assemblyOf(CATALOG), agent('s6'), undefined).tools.length, CATALOG.length - BRIDGE_TOOL_NAMES.length)
 })
 
 await check('search excludes eager tools and warm tools re-enter the table', () => {
