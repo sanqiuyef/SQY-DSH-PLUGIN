@@ -69,11 +69,11 @@
       "versions": [
         {
           "version": "0.2.3",
-          "publishTimestamp": 1793779469,
+          "publishTimestamp": 1793779869,
           "source": {
             "type": "git",
             "url": "https://github.com/sanqiuyef/SQY-DSH-PLUGIN",
-            "commit": "059633f4f0decd65af3069a9981c5e495c6df82c",
+            "commit": "b8b8d62be90a5e399439214e68ed0d1fd7df90b6",
             "path": "dsh-mcp-manager"
           },
           "engines": {
@@ -114,11 +114,11 @@
       "versions": [
         {
           "version": "0.3.0",
-          "publishTimestamp": 1793779469,
+          "publishTimestamp": 1793779869,
           "source": {
             "type": "git",
             "url": "https://github.com/sanqiuyef/SQY-DSH-PLUGIN",
-            "commit": "059633f4f0decd65af3069a9981c5e495c6df82c",
+            "commit": "b8b8d62be90a5e399439214e68ed0d1fd7df90b6",
             "path": "dsh-memory-manager"
           },
           "engines": {
@@ -158,11 +158,11 @@
       "versions": [
         {
           "version": "0.2.0",
-          "publishTimestamp": 1793779469,
+          "publishTimestamp": 1793779869,
           "source": {
             "type": "git",
             "url": "https://github.com/sanqiuyef/SQY-DSH-PLUGIN",
-            "commit": "059633f4f0decd65af3069a9981c5e495c6df82c",
+            "commit": "b8b8d62be90a5e399439214e68ed0d1fd7df90b6",
             "path": "dsh-mcp-gateway"
           },
           "engines": {
@@ -203,11 +203,11 @@
       "versions": [
         {
           "version": "0.1.7",
-          "publishTimestamp": 1793779469,
+          "publishTimestamp": 1793779869,
           "source": {
             "type": "git",
             "url": "https://github.com/sanqiuyef/SQY-DSH-PLUGIN",
-            "commit": "059633f4f0decd65af3069a9981c5e495c6df82c",
+            "commit": "b8b8d62be90a5e399439214e68ed0d1fd7df90b6",
             "path": "dsh-skill-manager"
           },
           "engines": {
@@ -248,11 +248,11 @@
       "versions": [
         {
           "version": "0.3.1",
-          "publishTimestamp": 1793779469,
+          "publishTimestamp": 1793779869,
           "source": {
             "type": "git",
             "url": "https://github.com/sanqiuyef/SQY-DSH-PLUGIN",
-            "commit": "059633f4f0decd65af3069a9981c5e495c6df82c",
+            "commit": "b8b8d62be90a5e399439214e68ed0d1fd7df90b6",
             "path": "dsh-plugin-hub"
           },
           "engines": {
