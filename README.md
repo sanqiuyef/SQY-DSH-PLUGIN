@@ -26,6 +26,7 @@ DSH 的「插件 → 发现 → 索引源」添加以下 **JSON 索引 URL**（�
 - jsDelivr 镜像：`https://cdn.jsdelivr.net/gh/sanqiuyef/SQY-DSH-PLUGIN@main/index.json`
 
 索引为 format-1 市场格式，版本来源是 git 提交（`source: git` + 精确 commit），安装时会固定到该提交。
+更新插件（版本号/代码）并提交后，运行 `node scripts/build-index.mjs` 重新生成 `index.json` 再提交即可。
 
 ### 从源码打包安装
 
