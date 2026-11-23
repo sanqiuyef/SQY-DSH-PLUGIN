@@ -80,7 +80,91 @@ export function pickLiveAgent(ctx, cwd) {
 }
 
 /**
- * 读取当前 live Agent 可见的插件技能。
+ * 读取当前 live Agent 可见的**全部**宿主技能（不只插件技能）。
+ *
+ * 宿主的 `ctx.skills` 返回的是合并后的**胜出者**，带权威的 `source` /
+ * `provider` / `path`；`snapshot()` 还给 `complete` 表示宿主本次发现是否完整。
+ * 这比插件自己抄一份 rank 表去推断遮蔽关系可靠得多，也让面板能回答
+ * 「宿主实际可见、但磁盘根里没有」的技能（preset / bundled provider）。
+ *
+ * 返回形状固定为 `{ available, complete, providerPrefix, skills, error? }`，
+ * `skills` 按 name、provider 排序；任何失败都返回 `available: false` 而不是抛错。
+ *
+ * @param {object} ctx - 插件上下文
+ * @param {{ cwd?: string }} [options] - 本次解析出的目录
+ * @returns {Promise<{ available: boolean, complete: boolean, providerPrefix: string,
+ *   skills: object[], error?: string }>}
+ */
+export async function listHostSkills(ctx, options = {}) {
+  const unavailable = (error) => ({
+    available: false,
+    complete: false,
+    providerPrefix: PLUGIN_PROVIDER_PREFIX,
+    skills: [],
+    error,
+  });
+  const requestedCwd = typeof options.cwd === 'string' && options.cwd.trim() !== '' ? options.cwd.trim() : undefined;
+  const agent = pickLiveAgent(ctx, requestedCwd);
+
+  let service;
+  try {
+    // 插件中心的 provider 注册在 agent.ctx 的 scope 层，优先用 Agent 自己的上下文；
+    // 没有 live Agent 时（冷会话 / 设置页刚打开）退到宿主的全局层，而不是直接放弃。
+    service = agent?.ctx?.get?.('skills') ?? ctx.get?.('skills');
+  } catch {
+    service = undefined;
+  }
+  if (service === null || service === undefined
+    || (typeof service.list !== 'function' && typeof service.snapshot !== 'function')) {
+    return unavailable(agent === undefined ? '没有 live Agent，且宿主 skills 服务不可用' : '宿主 skills 服务不可用');
+  }
+
+  const lookup = {};
+  if (agent !== undefined) lookup.scope = agent;
+  const lookupCwd = requestedCwd ?? (agent === undefined ? '' : agentCwd(ctx, agent) ?? '');
+  if (lookupCwd !== '') lookup.cwd = lookupCwd;
+
+  let summaries;
+  let complete = true;
+  try {
+    if (typeof service.snapshot === 'function') {
+      const snapshot = await service.snapshot(lookup);
+      summaries = snapshot?.skills;
+      complete = snapshot?.complete !== false;
+    } else {
+      summaries = await service.list(lookup);
+    }
+  } catch (error) {
+    return unavailable(`读取宿主技能失败：${error?.message ?? String(error)}`);
+  }
+  if (!Array.isArray(summaries)) return unavailable('宿主 skills 服务返回了非数组结果');
+
+  const skills = [];
+  for (const summary of summaries) {
+    if (summary === null || typeof summary !== 'object') continue;
+    const name = summary.name;
+    const provider = summary.provider;
+    if (typeof name !== 'string' || name === '') continue;
+    if (typeof provider !== 'string' || provider === '') continue;
+    const invocation = summary.invocation !== null && typeof summary.invocation === 'object' ? summary.invocation : {};
+    skills.push({
+      name,
+      description: typeof summary.description === 'string' ? summary.description : '',
+      ...(typeof summary.whenToUse === 'string' && summary.whenToUse !== '' ? { whenToUse: summary.whenToUse } : {}),
+      source: typeof summary.source === 'string' ? summary.source : '',
+      provider,
+      ...(typeof summary.path === 'string' && summary.path !== '' ? { path: summary.path } : {}),
+      modelInvocable: invocation.modelInvocable !== false,
+      userInvocable: invocation.userInvocable !== false,
+      ...(provider.startsWith(PLUGIN_PROVIDER_PREFIX) ? { pluginId: provider.slice(PLUGIN_PROVIDER_PREFIX.length) } : {}),
+    });
+  }
+  skills.sort((left, right) => left.name.localeCompare(right.name) || left.provider.localeCompare(right.provider));
+  return { available: true, complete, providerPrefix: PLUGIN_PROVIDER_PREFIX, skills };
+}
+
+/**
+ * 读取当前 live Agent 可见的插件技能（`plugin-hub:*` 的只读视图）。
  *
  * 返回形状固定为 `{ available, providerPrefix, skills, error? }`：
  * `skills` 是 `[{ name, provider, path? }]`（按 name、provider 排序），
@@ -91,52 +175,20 @@ export function pickLiveAgent(ctx, cwd) {
  * @returns {Promise<{ available: boolean, providerPrefix: string, skills: object[], error?: string }>}
  */
 export async function listPluginSkills(ctx, options = {}) {
-  const unavailable = (error) => ({ available: false, providerPrefix: PLUGIN_PROVIDER_PREFIX, skills: [], error });
-  const requestedCwd = typeof options.cwd === 'string' && options.cwd.trim() !== '' ? options.cwd.trim() : undefined;
-  const agent = pickLiveAgent(ctx, requestedCwd);
-  if (agent === undefined) return unavailable('没有 live Agent，无法读取插件技能');
-
-  let service;
-  try {
-    // 插件中心的 provider 注册在 agent.ctx 的 scope 层，优先用 Agent 自己的上下文。
-    service = agent.ctx?.get?.('skills') ?? ctx.get?.('skills');
-  } catch {
-    service = undefined;
+  const host = await listHostSkills(ctx, options);
+  if (host.available !== true) {
+    return { available: false, providerPrefix: PLUGIN_PROVIDER_PREFIX, skills: [], error: host.error };
   }
-  if (service === null || service === undefined || typeof service.list !== 'function') {
-    return unavailable('宿主 skills 服务不可用');
-  }
-
-  const lookupCwd = requestedCwd ?? agentCwd(ctx, agent) ?? '';
-  let summaries;
-  try {
-    const lookup = { scope: agent };
-    if (lookupCwd !== '') lookup.cwd = lookupCwd;
-    summaries = await service.list(lookup);
-  } catch (error) {
-    return unavailable(`读取插件技能失败：${error?.message ?? String(error)}`);
-  }
-  if (!Array.isArray(summaries)) return unavailable('宿主 skills 服务返回了非数组结果');
-
   const skills = [];
   const seen = new Set();
-  for (const summary of summaries) {
-    if (summary === null || typeof summary !== 'object') continue;
-    const provider = summary.provider;
-    if (typeof provider !== 'string' || !provider.startsWith(PLUGIN_PROVIDER_PREFIX)) continue;
-    const name = summary.name;
-    if (typeof name !== 'string' || name === '') continue;
+  for (const entry of host.skills) {
+    if (!entry.provider.startsWith(PLUGIN_PROVIDER_PREFIX)) continue;
     // 同名同 provider 只保留一条（理论上服务已去重，这里防御 provider 重复注册）。
-    const key = `${name}\u0000${provider}`;
+    const key = `${entry.name}\u0000${entry.provider}`;
     if (seen.has(key)) continue;
     seen.add(key);
-    skills.push({
-      name,
-      provider,
-      ...(typeof summary.path === 'string' && summary.path !== '' ? { path: summary.path } : {}),
-    });
+    skills.push({ name: entry.name, provider: entry.provider, ...(entry.path === undefined ? {} : { path: entry.path }) });
   }
-  skills.sort((left, right) => left.name.localeCompare(right.name) || left.provider.localeCompare(right.provider));
   return { available: true, providerPrefix: PLUGIN_PROVIDER_PREFIX, skills };
 }
 
@@ -182,4 +234,89 @@ export function applyPluginShadowing(skills, plugins) {
     marked += 1;
   }
   return { marked };
+}
+
+/**
+ * 用宿主的**实际胜出者**校验本地"谁被遮蔽"。
+ *
+ * rank 表是宿主私有常量的副本（`lib/roots.js`），宿主改档位或新增 provider
+ * 时会静默失准。这里拿宿主的 `path` 与本地条目的 `path` 直接比：不一致就说明
+ * 同名竞争里赢的不是这一条，与本地 rank 推断无关。
+ *
+ * 只在宿主给了 `path` 时判定（部分 provider 不提供路径，只能继续依赖 rank）。
+ *
+ * @param {object[]} skills - 扫盘技能（原地修改）
+ * @param {object[]} hostSkills - `listHostSkills().skills`
+ * @returns {{ marked: number }}
+ */
+export function applyHostShadowing(skills, hostSkills) {
+  if (!Array.isArray(skills) || !Array.isArray(hostSkills) || hostSkills.length === 0) return { marked: 0 };
+  const byName = new Map();
+  for (const entry of hostSkills) {
+    if (entry === null || typeof entry !== 'object') continue;
+    if (typeof entry.name !== 'string' || entry.name === '') continue;
+    if (!byName.has(entry.name)) byName.set(entry.name, entry);
+  }
+  let marked = 0;
+  for (const skill of skills) {
+    if (skill === null || typeof skill !== 'object') continue;
+    if (skill.state !== 'enabled') continue;
+    const winner = byName.get(skill.name);
+    if (winner === undefined) continue;
+    const winnerPath = typeof winner.path === 'string' && winner.path !== '' ? winner.path : undefined;
+    if (winnerPath === undefined) continue;
+    if (resolve(winnerPath) === resolve(skill.path)) continue;
+    skill.shadowed = true;
+    skill.shadowedByHost = {
+      name: winner.name,
+      provider: typeof winner.provider === 'string' ? winner.provider : '',
+      path: winnerPath,
+    };
+    skill.issues = mergeIssues(skill.issues, [
+      {
+        level: 'warn',
+        code: 'shadowed-by-host',
+        message: `宿主实际采用的是 ${winner.provider || '其他 provider'} 提供的同名技能（${winnerPath}），本条目不会被加载。`,
+      },
+    ]);
+    marked += 1;
+  }
+  return { marked };
+}
+
+/**
+ * 检测停用约定是否失效：`_disabled/` 里的条目本应对宿主不可见。
+ *
+ * 停用＝把条目移进 `<root>/_disabled/`，成立的前提是宿主只扫根目录的直接子项。
+ * 如果宿主将来改成递归发现，被停用的技能会悄悄重新生效。这里用「同名且
+ * description 相同」确认宿主确实看到了那一条（只是同名不算）。
+ *
+ * @param {object[]} skills - 含 `state: 'disabled'` 的扫盘结果
+ * @param {object[]} hostSkills - `listHostSkills().skills`
+ * @returns {object[]} 可直接并入 `overview.diagnostics` 的诊断条目
+ */
+export function findDisabledLeaks(skills, hostSkills) {
+  const leaks = [];
+  if (!Array.isArray(skills) || !Array.isArray(hostSkills) || hostSkills.length === 0) return leaks;
+  const byName = new Map();
+  for (const entry of hostSkills) {
+    if (entry === null || typeof entry !== 'object') continue;
+    if (typeof entry.name !== 'string' || entry.name === '') continue;
+    if (!byName.has(entry.name)) byName.set(entry.name, entry);
+  }
+  for (const skill of skills) {
+    if (skill === null || typeof skill !== 'object') continue;
+    if (skill.state !== 'disabled') continue;
+    const seen = byName.get(skill.name);
+    if (seen === undefined) continue;
+    if (typeof seen.description === 'string' && seen.description !== skill.description) continue;
+    leaks.push({
+      code: 'disabled-visible',
+      level: 'warn',
+      message: `宿主仍然发现了 _disabled/ 里的技能 "${skill.name}"：停用依赖「宿主只扫根目录直接子项」这一规则，当前宿主版本可能已改为递归发现。`,
+      rootId: skill.rootId,
+      name: skill.name,
+    });
+  }
+  return leaks;
 }

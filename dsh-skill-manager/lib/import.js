@@ -30,6 +30,12 @@ const MAX_DEPTH = 4;
 /** 递归时永不进入的目录名。 */
 const SKIP_DIRS = new Set(['.git', 'node_modules', '.svn', '.hg', '_trash', '_disabled', '.system']);
 
+/**
+ * 技能包里的说明文档不是技能。递归发现时如果把它们当候选，每一个都会以
+ * 「缺少 frontmatter」被跳过，导入一个包会刷出一串无关噪音。
+ */
+const INERT_MARKDOWN = /^(readme|changelog|changes|history|license|licence|copying|contributing|code_of_conduct|security|agents|claude)(\.md|\.markdown)?$/i;
+
 /** `stat` with ENOENT folded into `undefined`. */
 async function statOrUndefined(path) {
   try {
@@ -87,6 +93,7 @@ async function discover(entryPath, isDirectory) {
         continue;
       }
       if (!entry.isFile() || !/\.md$/i.test(entry.name)) continue;
+      if (INERT_MARKDOWN.test(entry.name)) continue;
       // A flat `.md` inside a discovery folder is only a skill when its
       // frontmatter says so; `analyzeContent` decides that per candidate.
       candidates.push({ path: full, kind: 'file' });

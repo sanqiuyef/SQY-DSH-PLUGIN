@@ -11,9 +11,10 @@
  */
 
 import { createHash } from 'node:crypto';
-import { readdir, readFile, stat } from 'node:fs/promises';
-import { join, relative, resolve, sep } from 'node:path';
+import { readdir, readFile, realpath, stat } from 'node:fs/promises';
+import { dirname, join, relative, resolve, sep } from 'node:path';
 
+import { badRequest } from './errors.js';
 import { analyzeContent, hasErrorIssue, mergeIssues, stripBom } from './parse.js';
 import { DISABLED_DIR, RESERVED_ENTRIES, TRASH_DIR } from './roots.js';
 
@@ -35,6 +36,70 @@ export function isInside(root, candidate) {
   return process.platform === 'win32'
     ? target.toLowerCase().startsWith(prefix.toLowerCase())
     : target.startsWith(prefix);
+}
+
+/**
+ * The realpath of the nearest existing ancestor of `path`.
+ *
+ * A write target may not exist yet (`_disabled/` before the first disable, a
+ * file about to be created), so resolving the path itself would fail. Resolving
+ * the nearest existing ancestor follows every symlink/junction on the way,
+ * which is what makes the escape check below honest.
+ */
+async function realAncestor(path) {
+  let current = resolve(path);
+  for (;;) {
+    try {
+      return await realpath(current);
+    } catch (error) {
+      if (error?.code !== 'ENOENT' && error?.code !== 'ENOTDIR') throw error;
+      const parent = dirname(current);
+      if (parent === current) return current;
+      current = parent;
+    }
+  }
+}
+
+/** Case-insensitive containment for two already-resolved absolute paths. */
+function containsReal(base, target) {
+  if (process.platform === 'win32') {
+    const lowerBase = base.toLowerCase();
+    const lowerTarget = target.toLowerCase();
+    return lowerTarget === lowerBase || lowerTarget.startsWith(lowerBase.endsWith(sep) ? lowerBase : lowerBase + sep);
+  }
+  return target === base || target.startsWith(base.endsWith(sep) ? base : base + sep);
+}
+
+/**
+ * Physical containment check: `target` must land inside `root` after every
+ * symlink/junction on both sides is resolved.
+ *
+ * The string-prefix {@link isInside} catches `..` and absolute escapes; this
+ * one catches a skill entry that is itself a link to somewhere else, which
+ * would otherwise let a save write outside the root.
+ *
+ * @param {string} root - skill root path
+ * @param {string} target - write/read target (may not exist yet)
+ * @returns {Promise<boolean>}
+ */
+export async function isInsideReal(root, target) {
+  if (!isInside(root, target)) return false;
+  const realRoot = await realAncestor(root);
+  const realTarget = await realAncestor(target);
+  return containsReal(realRoot, realTarget);
+}
+
+/**
+ * Throw `400 bad-request` unless the target physically resolves inside the root.
+ *
+ * @param {string} root - skill root path
+ * @param {string} target - write/read target (may not exist yet)
+ * @returns {Promise<void>}
+ */
+export async function assertInsideReal(root, target) {
+  if (!(await isInsideReal(root, target))) {
+    throw badRequest('目标路径通过符号链接越出技能根，已拒绝');
+  }
 }
 
 /** A skill entry name we are willing to touch: one ordinary path segment. */

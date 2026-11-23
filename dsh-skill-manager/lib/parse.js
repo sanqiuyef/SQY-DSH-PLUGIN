@@ -32,8 +32,14 @@ const LEGACY_INVOCATION_KEYS = {
 };
 
 /**
- * Keys this panel recognizes. Anything else is reported as a warning only —
- * a skill with extra keys still loads.
+ * Keys the host actually reads. Everything else is reported as a warning: the
+ * host's parser (`@deepseek-ai/dsh-skill-filesystem`) reads exactly these six
+ * names and silently ignores the rest, so a third-party key such as
+ * `allowed-tools` (a Claude Code convention) has no effect at all.
+ *
+ * `license`, `version`, `author` and `tags` are tolerated by convention: the
+ * host ignores them as well, but they are harmless documentation and warning
+ * about them on every imported skill would be noise.
  */
 const KNOWN_KEYS = new Set([
   'name',
@@ -46,12 +52,21 @@ const KNOWN_KEYS = new Set([
   'version',
   'author',
   'tags',
-  'allowed-tools',
-  'argument-hint',
 ]);
 
-/** A description above this length is legal but hurts every prompt that carries it. */
-const DESCRIPTION_WARN_CHARS = 1024;
+/**
+ * The host's skill catalog truncates each description to 500 characters before
+ * it reaches the model (`tool-skill`), so anything past that is invisible.
+ */
+const DESCRIPTION_WARN_CHARS = 500;
+
+/**
+ * A skill body is re-injected in full on every `skill` tool call — the host has
+ * no already-loaded state — and a single tool result above ~8k characters is
+ * spilled or pruned in history. Report the size instead of hiding it.
+ */
+const BODY_WARN_CHARS = 8192;
+
 
 /** Strip a leading UTF-8 BOM from a decoded string. */
 export function stripBom(text) {
@@ -242,7 +257,7 @@ export function analyzeContent(raw, { dirName, kind }) {
     issues.push(issue('error', 'name-invalid', `name "${name}" 不是合法技能名：只允许小写字母、数字与连字符（如 my-skill）。`));
   } else if (name !== dirName) {
     issues.push(
-      issue('warn', 'name-mismatch', `name "${name}" 与所在条目名 "${dirName}" 不一致：宿主按 name 建索引，文件名只影响阅读。`),
+      issue('info', 'name-mismatch', `name "${name}" 与所在条目名 "${dirName}" 不一致：宿主不校验一致性，只影响阅读（条目按 name 建索引）。`),
     );
   }
 
@@ -250,7 +265,7 @@ export function analyzeContent(raw, { dirName, kind }) {
     issues.push(issue('error', 'description-missing', 'frontmatter 缺少非空的 description（会进入模型技能目录，务必写清触发场景）。'));
   } else if (description.length > DESCRIPTION_WARN_CHARS) {
     issues.push(
-      issue('warn', 'description-long', `description 长度 ${description.length} 字符，超过 ${DESCRIPTION_WARN_CHARS} 会显著占用技能目录预算。`),
+      issue('info', 'description-long', `description 长度 ${description.length} 字符，宿主模型目录只保留前 ${DESCRIPTION_WARN_CHARS} 字符，超出部分模型看不到。`),
     );
   }
 
@@ -270,7 +285,24 @@ export function analyzeContent(raw, { dirName, kind }) {
 
   for (const key of Object.keys(data)) {
     if (KNOWN_KEYS.has(key)) continue;
-    issues.push(issue('warn', 'unknown-key', `未知的 frontmatter 顶层键 "${key}"：宿主会忽略它（可能是拼写错误或旧版字段）。`));
+    issues.push(
+      issue(
+        'warn',
+        'unknown-key',
+        `frontmatter 顶层键 "${key}" 不会被宿主读取（宿主只认 name / description / whenToUse / metadata / disable-model-invocation / user-invocable）：写上它等于没写。`,
+      ),
+    );
+  }
+
+  const bodyLength = stripBom(body).trim().length;
+  if (bodyLength > BODY_WARN_CHARS) {
+    issues.push(
+      issue(
+        'info',
+        'body-long',
+        `正文 ${bodyLength} 字符，超过 ${BODY_WARN_CHARS}：宿主每次调用 skill 都会整篇重新注入，且单条工具结果过大时会被转存/修剪。建议拆到 references/ 里按需读取。`,
+      ),
+    );
   }
 
   const whenToUse = stringField(data, 'whenToUse');

@@ -8,6 +8,7 @@
  * Config (all optional; every field has a default in the environment):
  *   dshHome          - harness config root (default `$DSH_HOME` or `~/.dsh`)
  *   agentsHome       - shared agents root (default `$DSH_AGENTS_HOME` or `~/.agents`)
+ *   zcodeHome        - ZCode root (default `$ZCODE_HOME` or `~/.zcode`)
  *   customSkillDirs  - extra roots scanned at rank 300
  *   marketDir        - local skills market clone (default `<dshHome>/skills-management/market`)
  *   bundledSkillDir  - read-only bundled root at rank 600 (default `$DSH_BUNDLED_SKILL_DIR`)
@@ -32,6 +33,7 @@ export function resolveOptions(config = {}) {
   return {
     dshHome: optionalText(source.dshHome),
     agentsHome: optionalText(source.agentsHome),
+    zcodeHome: optionalText(source.zcodeHome),
     customSkillDirs: Array.isArray(source.customSkillDirs)
       ? source.customSkillDirs.filter((entry) => typeof entry === 'string' && entry.trim() !== '')
       : [],

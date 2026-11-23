@@ -15,6 +15,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import { registerRoutes, API_BASE } from '../lib/routes.js';
+import { setRuntimeDirs } from '../lib/custom-roots.js';
 
 let passed = 0;
 const failures = [];
@@ -130,21 +131,31 @@ try {
   const opened = [];
   const disposeRoutes = registerRoutes(ctx, { customSkillDirs: [rootPath] }, { openInFileManager: (path) => opened.push(path) });
 
-  await check('thirteen routes are registered', () => {
-    assert.equal(routes.size, 13);
+  await check('twenty-three route paths are registered', () => {
+    assert.equal(routes.size, 23);
     assert.deepEqual([...routes.keys()].sort(), [
+      `${API_BASE}/host-skills`,
       `${API_BASE}/market`,
       `${API_BASE}/market/install`,
+      `${API_BASE}/market/uninstall`,
       `${API_BASE}/open`,
       `${API_BASE}/overview`,
+      `${API_BASE}/roots/custom`,
+      `${API_BASE}/search`,
       `${API_BASE}/skill`,
       `${API_BASE}/skill/batch`,
       `${API_BASE}/skill/create`,
       `${API_BASE}/skill/delete`,
+      `${API_BASE}/skill/export`,
+      `${API_BASE}/skill/file`,
+      `${API_BASE}/skill/files`,
       `${API_BASE}/skill/import`,
       `${API_BASE}/skill/invocation`,
       `${API_BASE}/skill/save`,
       `${API_BASE}/skill/toggle`,
+      `${API_BASE}/trash`,
+      `${API_BASE}/trash/purge`,
+      `${API_BASE}/trash/restore`,
       `${API_BASE}/usage`,
     ].sort());
   });
@@ -712,11 +723,260 @@ try {
       assert.equal(response.status, 200);
       const body = response.json();
       assert.equal(body.pluginSkills.available, false);
-      assert.match(body.pluginSkills.error, /读取插件技能失败/);
+      assert.match(body.pluginSkills.error, /读取宿主技能失败/);
       assert.equal(body.counts.shadowedByPlugin, 0);
     } finally {
       disposers.forEach((dispose) => dispose());
     }
+  });
+
+  /* v3：回收站 / 资源文件 / 正文搜索 / host-skills / 市场卸载 / 严格入参 */
+  const q = `cwd=${encodeURIComponent(base)}`;
+  await mkdir(join(rootPath, '_trash', 'trashed-a@20260101T000000'), { recursive: true });
+  await writeFile(join(rootPath, '_trash', 'trashed-a@20260101T000000', 'SKILL.md'), alphaContent.replace('alpha', 'trashed-a'), 'utf8');
+  await mkdir(join(rootPath, '_trash', 'trashed-b@20260101T000001'), { recursive: true });
+  await writeFile(join(rootPath, '_trash', 'trashed-b@20260101T000001', 'SKILL.md'), alphaContent.replace('alpha', 'trashed-b'), 'utf8');
+  await mkdir(join(rootPath, 'alpha', 'references'), { recursive: true });
+  await writeFile(join(rootPath, 'alpha', 'references', 'notes.md'), '# notes\n', 'utf8');
+
+  await check('trash route lists entries and restore brings one back', async () => {
+    const listed = await call(routes, makeRequest({ path: `/trash?rootId=custom:0&${q}` }));
+    assert.equal(listed.status, 200);
+    const body = listed.json();
+    assert.equal(body.counts.total >= 2, true);
+    const entry = body.roots[0].entries.find((candidate) => candidate.name === 'trashed-a');
+    assert.ok(entry);
+
+    const restored = await call(routes, makeRequest({
+      method: 'POST', path: '/trash/restore',
+      headers: { 'content-type': 'application/json' },
+      body: { rootId: 'custom:0', token: entry.token, cwd: base },
+    }));
+    assert.equal(restored.status, 200);
+    assert.equal(restored.json().state, 'enabled');
+  });
+
+  await check('trash purge refuses an unconfirmed sweep and accepts a confirmed one', async () => {
+    const refused = await call(routes, makeRequest({
+      method: 'POST', path: '/trash/purge',
+      headers: { 'content-type': 'application/json' },
+      body: { rootId: 'custom:0', all: true, cwd: base },
+    }));
+    assert.equal(refused.status, 400);
+
+    const purged = await call(routes, makeRequest({
+      method: 'POST', path: '/trash/purge',
+      headers: { 'content-type': 'application/json' },
+      body: { rootId: 'custom:0', all: true, confirm: true, cwd: base },
+    }));
+    assert.equal(purged.status, 200);
+    assert.equal(purged.json().removed.length >= 1, true);
+  });
+
+  await check('resource routes list, read, write and reject an escape', async () => {
+    const listed = await call(routes, makeRequest({ path: `/skill/files?rootId=custom:0&dirName=alpha&kind=directory&${q}` }));
+    assert.equal(listed.status, 200);
+    assert.equal(listed.json().entries.some((entry) => entry.relativePath === 'references/notes.md'), true);
+
+    const read = await call(routes, makeRequest({ path: `/skill/file?rootId=custom:0&dirName=alpha&kind=directory&file=references/notes.md&${q}` }));
+    assert.equal(read.status, 200);
+    const hash = read.json().hash;
+    assert.match(hash, /^[a-f0-9]{64}$/);
+
+    const written = await call(routes, makeRequest({
+      method: 'POST', path: '/skill/file',
+      headers: { 'content-type': 'application/json' },
+      body: { rootId: 'custom:0', dirName: 'alpha', kind: 'directory', file: 'references/notes.md', content: '# changed\n', hash, cwd: base },
+    }));
+    assert.equal(written.status, 200);
+
+    const escape = await call(routes, makeRequest({ path: `/skill/file?rootId=custom:0&dirName=alpha&kind=directory&file=../../etc/passwd&${q}` }));
+    assert.equal(escape.status, 400);
+
+    const wrongMethod = await call(routes, makeRequest({ method: 'PUT', path: '/skill/file' }));
+    assert.equal(wrongMethod.status, 405);
+  });
+
+  await check('search route matches the body and rejects a one-character query', async () => {
+    const found = await call(routes, makeRequest({ path: `/search?q=${encodeURIComponent('Fixture alpha')}&${q}` }));
+    assert.equal(found.status, 200);
+    assert.equal(found.json().results.length >= 1, true);
+
+    const tooShort = await call(routes, makeRequest({ path: `/search?q=a&${q}` }));
+    assert.equal(tooShort.status, 400);
+  });
+
+  await check('host-skills route exposes the live catalog and overview derives hostOnly', async () => {
+    const summaries = [{
+      name: 'preset-only',
+      description: 'from a preset provider',
+      source: 'bundled',
+      provider: 'filesystem',
+      invocation: { modelInvocable: true, userInvocable: true },
+    }];
+    const service = { snapshot: async () => ({ skills: summaries, complete: true }) };
+    const agent = fakeAgent({ cwd: base, skills: service });
+    const hostCtx = fakeContext({ agents: { list: () => [agent] }, cwd: base });
+    const hostDisposers = registerRoutes(hostCtx.ctx, { customSkillDirs: [rootPath] });
+    try {
+      const response = await call(hostCtx.routes, makeRequest({ path: `/host-skills?${q}` }));
+      assert.equal(response.status, 200);
+      const body = response.json();
+      assert.equal(body.available, true);
+      assert.equal(body.complete, true);
+      assert.equal(body.count, 1);
+      assert.deepEqual(body.providers, ['filesystem']);
+      assert.equal(body.skills[0].modelInvocable, true);
+
+      const overview = await call(hostCtx.routes, makeRequest({ path: `/overview?${q}` }));
+      const payload = overview.json();
+      assert.equal(payload.hostSkills.available, true);
+      assert.equal(payload.hostOnly.length, 1);
+      assert.equal(payload.hostOnly[0].name, 'preset-only');
+    } finally {
+      hostDisposers.forEach((dispose) => dispose());
+    }
+  });
+
+  await check('save requires a hash, open reports a missing target, batch supports invocation', async () => {
+    const noHash = await call(routes, makeRequest({
+      method: 'POST', path: '/skill/save',
+      headers: { 'content-type': 'application/json' },
+      body: { rootId: 'custom:0', dirName: 'alpha', kind: 'directory', content: '---\nname: alpha\ndescription: x\n---\n', cwd: base },
+    }));
+    assert.equal(noHash.status, 400);
+    assert.equal(noHash.json().error.code, 'bad-request');
+
+    const missing = await call(routes, makeRequest({
+      method: 'POST', path: '/open',
+      headers: { 'content-type': 'application/json' },
+      body: { rootId: 'custom:0', dirName: 'nope', kind: 'directory', cwd: base },
+    }));
+    assert.equal(missing.status, 404);
+
+    const batch = await call(routes, makeRequest({
+      method: 'POST', path: '/skill/batch',
+      headers: { 'content-type': 'application/json' },
+      body: { action: 'invocation', model: false, user: true, items: [{ rootId: 'custom:0', dirName: 'alpha', kind: 'directory' }], cwd: base },
+    }));
+    assert.equal(batch.status, 200);
+    assert.equal(batch.json().results[0].invocation.model, false);
+  });
+
+  await check('market install then uninstall clears the ledger record', async () => {
+    const marketDir = join(base, 'market');
+    await mkdir(join(marketDir, 'skills', 'repo-a', 'skill-a'), { recursive: true });
+    await writeFile(
+      join(marketDir, 'skills', 'repo-a', 'skill-a', 'SKILL.md'),
+      ['---', 'name: skill-a', 'description: Market fixture.', '---', 'body'].join('\n'),
+      'utf8',
+    );
+    const marketCtx = fakeContext({ cwd: base });
+    const marketDisposers = registerRoutes(marketCtx.ctx, { customSkillDirs: [rootPath], marketDir });
+    try {
+      const installed = await call(marketCtx.routes, makeRequest({
+        method: 'POST', path: '/market/install',
+        headers: { 'content-type': 'application/json' },
+        body: { repo: 'repo-a', folder: 'skill-a', rootId: 'custom:0', cwd: base },
+      }));
+      assert.equal(installed.status, 200);
+
+      const uninstalled = await call(marketCtx.routes, makeRequest({
+        method: 'POST', path: '/market/uninstall',
+        headers: { 'content-type': 'application/json' },
+        body: { repo: 'repo-a', folder: 'skill-a', rootId: 'custom:0', cwd: base },
+      }));
+      assert.equal(uninstalled.status, 200);
+      assert.equal(uninstalled.json().ledgerRemoved, true);
+
+      const market = await call(marketCtx.routes, makeRequest({ path: `/market?query=skill-a&${q}` }));
+      const entries = market.json().repos.flatMap((repo) => repo.skills);
+      assert.equal(entries.every((entry) => entry.installed === false), true);
+    } finally {
+      marketDisposers.forEach((dispose) => dispose());
+    }
+  });
+
+  await check('custom roots route reports profile state and persists a managed block', async () => {
+    const profileDir = join(base, 'profile');
+    await mkdir(profileDir, { recursive: true });
+    const patchPath = join(profileDir, 'cordis.patch.yml');
+    await writeFile(patchPath, '# profile patch\n[]\n', 'utf8');
+
+    const rootsCtx = fakeContext({ cwd: base });
+    rootsCtx.ctx.configEditor = { documentPath: patchPath };
+    const rootsDisposers = registerRoutes(rootsCtx.ctx, { customSkillDirs: [rootPath] });
+    try {
+      const listed = await call(rootsCtx.routes, makeRequest({ path: `/roots/custom?${q}` }));
+      assert.equal(listed.status, 200);
+      assert.equal(listed.json().profilePath, patchPath);
+      assert.equal(listed.json().writable, true);
+
+      const extra = join(base, 'extra-roots');
+      await mkdir(extra, { recursive: true });
+      const written = await call(rootsCtx.routes, makeRequest({
+        method: 'POST', path: '/roots/custom',
+        headers: { 'content-type': 'application/json' },
+        body: { dirs: [extra], persist: true, cwd: base },
+      }));
+      assert.equal(written.status, 200);
+      assert.equal(written.json().persisted, true);
+      assert.equal(written.json().requiresReload, true);
+
+      const text = await readFile(patchPath, 'utf8');
+      assert.match(text, /dsh-skill-manager custom roots/);
+      assert.match(text, /extra-roots/);
+
+      const reloaded = await call(rootsCtx.routes, makeRequest({ path: `/roots/custom?${q}` }));
+      assert.equal(reloaded.json().persisted.length, 1);
+    } finally {
+      setRuntimeDirs([], base);
+      rootsDisposers.forEach((dispose) => dispose());
+    }
+  });
+
+  await check('export route writes an archive and refuses to overwrite one', async () => {
+    await mkdir(join(rootPath, 'export-only'), { recursive: true });
+    await writeFile(join(rootPath, 'export-only', 'SKILL.md'), alphaContent.replace('alpha', 'export-only'), 'utf8');
+    const target = join(base, 'export-only.zip');
+    const body = {
+      rootId: 'custom:0', dirName: 'export-only', kind: 'directory', targetPath: target, cwd: base,
+    };
+    const first = await call(routes, makeRequest({
+      method: 'POST', path: '/skill/export', headers: { 'content-type': 'application/json' }, body,
+    }));
+    assert.equal(first.status, 200);
+    assert.equal(first.json().path, target);
+    assert.equal(first.json().files >= 1, true);
+
+    const again = await call(routes, makeRequest({
+      method: 'POST', path: '/skill/export', headers: { 'content-type': 'application/json' }, body,
+    }));
+    assert.equal(again.status, 409);
+
+    const badExt = await call(routes, makeRequest({
+      method: 'POST', path: '/skill/export',
+      headers: { 'content-type': 'application/json' },
+      body: { ...body, targetPath: join(base, 'export-only.txt') },
+    }));
+    assert.equal(badExt.status, 400);
+
+    // 删掉磁盘上的技能，再从压缩包导入回来：验证解压 + 发现 + 拍平。
+    const removed = await call(routes, makeRequest({
+      method: 'POST', path: '/skill/delete',
+      headers: { 'content-type': 'application/json' },
+      body: { rootId: 'custom:0', dirName: 'export-only', kind: 'directory', cwd: base },
+    }));
+    assert.equal(removed.status, 200);
+
+    const imported = await call(routes, makeRequest({
+      method: 'POST', path: '/skill/import',
+      headers: { 'content-type': 'application/json' },
+      body: { rootId: 'custom:0', path: target, cwd: base },
+    }));
+    assert.equal(imported.status, 200);
+    assert.equal(imported.json().archive, true);
+    assert.deepEqual(imported.json().imported.map((entry) => entry.name), ['export-only']);
   });
 
   await check('disposing the routes unregisters every handler', () => {

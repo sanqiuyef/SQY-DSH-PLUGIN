@@ -1,4 +1,4 @@
-# dsh-skill-manager — Host/Client API 契约（v2）
+# dsh-skill-manager — Host/Client API 契约（v3.1）
 
 本文件是 Host 半侧（`lib/`）与浏览器半侧（`client/client.js`）之间**唯一的接口约定**。
 任何一侧改动字段名/路径，都必须先改本文件并同步另一侧。
@@ -7,7 +7,7 @@
 - 路由前缀：`/skill-manager/api`（同源，`fetch(..., { credentials: 'same-origin' })`）
 - 响应：`application/json; charset=utf-8`，`cache-control: no-store`
 - 错误信封：`{ "error": { "code": string, "message": string } }`，HTTP 状态码同步携带语义
-- 写操作：仅 `POST`，`content-type: application/json`，body ≤ 256 KiB
+- 写操作：仅 `POST`，`content-type: application/json`，body ≤ 512 KiB（内容本身仍 ≤ 256 KiB，见 §3.3）
 - v2 新增 4 条路由（§3.10–§3.13），字段只增不改，但有两处**语义**变化必须知道：
   1. `overview.market.installed` 从「个人根同名的技能数」变为「本次请求的可写根里的安装账本条目数」；
   2. `market.repos[].skills[].installed` 从「按 name 匹配个人根」变为「按 `{repo, folder}` + 目标根精确匹配账本」，
@@ -21,15 +21,19 @@ Host 按与宿主 `dsh-skill-filesystem` **相同的 rank 表**扫描（顺序�
 | rank | rootId | source | 路径 | kind | 可写 |
 |---:|---|---|---|---|---|
 | 100 | `project-dsh` | `project-dsh` | `<projectRoot>/.dsh/skills` | project | ✅ |
+| 150 | `project-zcode` | `project-zcode` | `<projectRoot>/.zcode/skills` | project | ✅ |
 | 200 | `project-agents` | `project-agents` | `<projectRoot>/.agents/skills` | project | ✅ |
 | 300 | `custom:<n>` | `custom` | 来自插件 Config `customSkillDirs` | custom | ✅ |
 | 400 | `user-dsh` | `user-dsh` | `<dshHome>/skills`（跳过 `.system` 子目录） | user | ✅ |
+| 450 | `user-zcode` | `user-zcode` | `<zcodeHome>/skills`（默认 `~/.zcode/skills`） | user | ✅ |
 | 500 | `user-agents` | `user-agents` | `<agentsHome>/skills` | user | ✅ |
 | 600 | `bundled` | `bundled` | Config `bundledSkillDir`（若配置） | bundled | ❌ 只读 |
 
+`.zcode` 与 `.agents` 成对出现、`.zcode` 排在前，与 ZCode 自己的根顺序一致（`apps/zcode-cli/packages/adapters/src/skills/roots.ts`）；`user-zcode` 排在 `user-dsh` 之后，所以 `~/.dsh/skills` 里的副本仍然胜出，ZCode 那份标 `shadowed` 而不是静默重复。
+
 - `projectRoot`＝从请求 `cwd` 向上找最近含 `.git` 的祖先；找不到则用 `cwd` 本身。
 - 无 `cwd` 时，Host 取**当前活跃会话的生效目录**（`workingDirectory.get(session)`，取最新一个 live agent），再回退 `workingDirectory.defaultDirectory`，最后回退进程 cwd。设置面板不传 `cwd` 也能对上"我当前在哪个项目"。
-- `dshHome` 默认 `%DSH_HOME%` 或 `~/.dsh`；`agentsHome` 默认 `%DSH_AGENTS_HOME%` 或 `~/.agents`。允许 Config 覆盖。
+- `dshHome` 默认 `%DSH_HOME%` 或 `~/.dsh`；`agentsHome` 默认 `%DSH_AGENTS_HOME%` 或 `~/.agents`；`zcodeHome` 默认 `%ZCODE_HOME%` 或 `~/.zcode`。允许 Config 覆盖。
 - 一个根可能不存在（`exists: false`）：仍要出现在 `roots[]` 里，前端展示为"未创建"。
 - 发现规则与宿主一致：只扫描根目录的**直接子项**——`<name>/SKILL.md`（目录技能）或 `<name>.md`（单文件技能），不递归。
 - 停用位：`<root>/_disabled/<name>/` 或 `<root>/_disabled/<name>.md`（本插件约定，宿主没有原生停用）。
@@ -155,14 +159,16 @@ interface SkillDetail {
 
 ```ts
 // 请求
-{ rootId, name, description, whenToUse?, body?, invocation?: { model?: boolean, user?: boolean } }
+{ rootId, name, description, whenToUse?, body?, invocation?: { model?: boolean, user?: boolean },
+  kind?: 'directory' | 'file' }
 // 成功 200
 { ok: true, skill: Skill }
 ```
 
-- `name` 必须 kebab-case、单路径段；目标根内重名 → 409 `exists`。
+- `name` 必须 kebab-case、单路径段、≤64 字符；目标根内（**含 `_disabled/`**）重名 → 409 `exists`。
 - 只在**可写**根下创建；bundled → 403 `read-only`。
-- 生成目录技能：`<root>/<name>/SKILL.md`，frontmatter 含 `name` / `description` /（可选）`whenToUse`；`invocation` 为 false 时写 `disable-model-invocation: true` / `user-invocable: false`。
+- `kind` 省略时生成目录技能 `<root>/<name>/SKILL.md`；`kind: 'file'` 生成单文件技能 `<root>/<name>.md`。
+- frontmatter 含 `name` / `description` /（可选）`whenToUse`；`invocation` 为 false 时写 `disable-model-invocation: true` / `user-invocable: false`。
 
 ### 3.5 `POST /skill-manager/api/skill/toggle`
 
@@ -188,12 +194,12 @@ interface SkillDetail {
 ### 3.7 `POST /skill-manager/api/open`
 
 ```ts
-{ rootId?, dirName?, kind? }   // 都不给 → 打开该根目录
+{ rootId, dirName?, kind?, state? }   // 不给 dirName → 打开该根目录
 // 成功 200
 { ok: true, opened: string }
 ```
 
-用系统文件管理器打开（Windows `explorer.exe`）。仅允许打开**扫描过的根**或其**直接子项**。
+用系统文件管理器打开（Windows `explorer.exe`）。仅允许打开**扫描过的根**或其**直接子项**；`state` 决定停用技能去 `_disabled/` 下找。目标不存在 → 404 `not-found`（不再静默成功）。
 
 ### 3.8 `GET /skill-manager/api/market?query=&limit=&perRepo=`
 
@@ -265,6 +271,7 @@ sha256 与安装时记录的比较 ——
 
 - `rootId` 默认 `user-dsh`；必须是可写根。
 - 目标同名已存在且 `overwrite !== true` → 409 `exists`。
+- `overwrite: true` **只覆盖本面板装的那份**：账本里同根同名记录的 `targetPath` 必须等于磁盘上现有条目，否则 409 `conflict`（`{error:{code:'conflict',message:'目标不是本面板安装的，未覆盖'}}`）——避免「更新」把用户手写的同名技能静默移进 `_trash/`。
 - 复制目录（含 references/scripts/assets）；先复制到 `<root>/.install-<name>-<ts>` 再 rename，避免半成品。
 - 安装后**不**自动启用/停用任何状态（新拷贝即启用）。
 - 成功后写**安装账本** `<marketDir>/../install-state.json`（与 `skills-market-sync.json` 同目录）：
@@ -355,14 +362,17 @@ sha256 与安装时记录的比较 ——
 ```ts
 // 请求
 {
-  action: 'enable' | 'disable' | 'delete'
-  items: Array<{ rootId: string, dirName: string, kind?: 'directory' | 'file' }>   // 1..200 条
+  action: 'enable' | 'disable' | 'delete' | 'invocation'
+  model?: boolean            // action === 'invocation' 时必填
+  user?: boolean             // action === 'invocation' 时必填
+  items: Array<{ rootId: string, dirName: string, kind?: 'directory' | 'file', state?: 'enabled' | 'disabled' }>   // 1..200 条
 }
 // 成功 200
 {
   ok: true, action,
   results: Array<
-    | { ok: true, rootId, dirName, kind, state?: 'enabled' | 'disabled', trashed?: string }
+    | { ok: true, rootId, dirName, kind, state?: 'enabled' | 'disabled', trashed?: string,
+        ledgerRemoved?: boolean, invocation?: { model: boolean, user: boolean } }
     | { ok: false, rootId, dirName, kind, error: { code: string, message: string } }
   >,
   counts: { total: number, ok: number, failed: number }
@@ -370,6 +380,8 @@ sha256 与安装时记录的比较 ——
 ```
 
 - `action` 非法或 `items` 为空/超过 200 条 → 400 `bad-request`（整请求拒绝）。
+- `action: 'invocation'` 对每条写同一组 `model` / `user`（三态批量），走 §3.10 的同一套改写与保护。
+- `action: 'delete'` 成功后同时清理安装账本（`ledgerRemoved`），与 §8.5 同语义。
 - 单条错误码复用 §4（`not-found`、`exists`、`read-only`、`bad-request`…），放在 `results[i].error`。
 - 语义等同逐条调用 §3.5 / §3.6：删除仍是移入 `_trash/`。
 
@@ -447,14 +459,248 @@ export function apply(ctx, config) { /* ctx.effect(() => registerRoutes(ctx, con
 | `yaml-invalid` | error | YAML 解析失败（带 line） |
 | `name-missing` | error | 缺少 `name` |
 | `name-invalid` | error | `name` 非 kebab-case |
-| `name-mismatch` | warn | `name` 与目录名不一致 |
+| `name-mismatch` | info | `name` 与条目名不一致（宿主不校验一致性，仅提示易读性） |
 | `description-missing` | error | 缺少 `description` |
-| `description-long` | warn | description > 1024 字符 |
+| `description-long` | info | description > 500 字符（宿主模型目录按 500 字符截断） |
+| `body-long` | info | 正文 > 8192 字符（宿主单次工具结果会被 spill/prune，且每次调用都全量重注入） |
 | `invocation-invalid` | error | 调用键不是合法布尔 |
-| `unknown-key` | warn | frontmatter 有未知顶层键 |
+| `unknown-key` | warn | frontmatter 有宿主不读取的顶层键（宿主只读 name / description / whenToUse / metadata / disable-model-invocation / user-invocable） |
 | `duplicate-name` | warn | 同根重名（先到先得） |
 | `shadowed` | warn | 被更高 rank 根的同名技能遮蔽 |
 | `shadowed-by-plugin` | warn | 被同名插件技能（provider `plugin-hub:*`，rank 350）遮蔽 |
 | `root-missing` | warn | 根目录不存在 |
 | `read-error` | error | 文件读取失败 |
-| `skill-md-missing` | warn | 目录里没有 SKILL.md（仅提示，不进列表） |
+
+`level: 'info'` 是 v3 新增的第三档：不进「异常」，不影响启停，只在诊断区以中性色列出。前端必须按三档渲染（error 红 / warn 黄 / info 灰），且 `counts` 只统计 error 级的 invalid。
+
+## 8. v3 增补
+
+v3 在 v2 之上只增不改（`pluginSkills`、`invocation`、`toggle` 等全部保留），新增 5 条路由与 3 处语义修正：
+
+1. `overview` 增加 `hostSkills` 与 `hostOnly`：面板第一次能回答「宿主实际可见、但磁盘上没有」的技能（§8.1）。
+2. 新增宿主技能快照路由 `GET /host-skills`（§8.1）。
+3. 新增回收站路由 `GET /trash` / `POST /trash/restore` / `POST /trash/purge`（§8.2）。
+4. 新增技能资源文件路由 `GET /skill/files` / `GET /skill/file` / `POST /skill/file`（§8.3）。
+5. 新增正文搜索路由 `GET /search`（§8.4）。
+6. 新增市场卸载 `POST /market/uninstall`（§8.5）。
+7. 语义修正：`skill/create` 支持 `kind: 'file'`（§3.4）；`skill/batch` 支持 `action: 'invocation'`（§3.12）；`skill/save` 的 `hash` 由可选改为**必填**（§3.3）；`overview.market.installed` 不再回退为「同名技能数」（§3.1）。
+
+### 8.1 宿主可见技能（hostSkills / hostOnly）
+
+`GET /skill-manager/api/host-skills?cwd=<abs>`
+
+```ts
+interface HostSkillsView {
+  available: boolean        // 宿主 skills 服务或 live Agent 不可用时 false
+  complete: boolean         // snapshot().complete；false = 宿主本次发现不完整
+  error?: string
+  count: number
+  providers: string[]       // 去重排序，如 ["filesystem", "plugin-hub:demo"]
+  skills: Array<{
+    name: string
+    description: string
+    whenToUse?: string
+    source: string          // 宿主 SkillSource（project-dsh / user-dsh / bundled / custom / runtime / 任意字符串）
+    provider: string
+    path?: string
+    modelInvocable: boolean
+    userInvocable: boolean
+    pluginId?: string       // provider 以 `plugin-hub:` 开头时给出后半段
+  }>
+}
+```
+
+读取顺序：有 live Agent 时走 `agent.ctx.get('skills') ?? ctx.get('skills')` 的 `snapshot({ scope: agent, cwd })`（退化为 `list()` 时 `complete: true`）；任何异常 → `available: false`，绝不抛错。
+
+`overview` 增加两个字段：
+
+```ts
+hostSkills: { available, complete, count, providers, error? }    // 明细走 /host-skills
+hostOnly: Array<{                                                 // 宿主可见、磁盘扫不到
+  name, description, whenToUse?, source, provider, path?,
+  modelInvocable, userInvocable, pluginId?
+}>
+```
+
+`hostOnly` 的判定：按 `name` 与本次扫盘结果（含停用条目）取差集。它们**只读**：没有 rootId，不能启停/编辑，前端只能展示来源与「由 xx 提供」。
+`pluginSkills`（v2 字段）继续保留，语义不变：只统计 provider 为 `plugin-hub:*` 的条目，用于同名遮蔽标注。
+
+### 8.2 回收站
+
+`GET /skill-manager/api/trash?cwd=<abs>&rootId=<optional>`
+
+```ts
+interface TrashView {
+  roots: Array<{
+    rootId: string
+    rootPath: string
+    writable: boolean
+    entries: Array<{
+      token: string        // _trash 下的条目名，形如 "alpha@20260101T120000-2" 或 "alpha@20260101T120000.md"
+      name: string         // 去掉时间戳与序号后的原始条目名（不含 .md）
+      kind: 'directory' | 'file'
+      path: string         // 绝对路径
+      size: number
+      mtimeMs: number
+    }>
+  }>
+  counts: { total: number }
+}
+```
+
+`POST /skill-manager/api/trash/restore`
+```ts
+// 请求
+{ rootId, token, cwd?, overwrite?: boolean }
+// 成功 200
+{ ok: true, restored: string, state: 'enabled' }
+```
+- 目标位置按 token 里的原名与 kind 还原到 `<root>/<name>`（目录）或 `<root>/<name>.md`。
+- 目标已存在且 `overwrite !== true` → 409 `exists`；`overwrite: true` 时先把现有条目移进 `_trash/`（带新时间戳），再还原。
+- `_disabled/` 里的条目**不在回收站视图**里（那是停用，不是删除）。
+- 只读根 → 403 `read-only`；token 非法/不存在 → 400 / 404。
+
+`POST /skill-manager/api/trash/purge`
+```ts
+// 请求：单个 token，或整根清空
+{ rootId, token, cwd? } | { rootId, all: true, confirm: true, cwd? }
+// 成功 200
+{ ok: true, removed: string[] }
+```
+- 这是插件里**唯一会真正删除内容**的接口，且只删 `<root>/_trash/` 下的条目。
+- `all: true` 必须同时给 `confirm: true`，否则 400；`token` 必须匹配 `_trash` 直接子项且 `isSafeSegment`，越界 400。
+- 单个 token 支持目录与 `.md` 文件；`all` 清空后 `_trash/` 目录保留。
+
+### 8.3 技能资源文件
+
+技能目录（`kind: 'directory'`）里的 `references/`、`scripts/`、`assets/` 等文件。单文件技能（`kind: 'file'`）只有自身，本组路由对它返回 `entries: []`。
+
+`GET /skill-manager/api/skill/files?rootId=&dirName=&kind=&state=&cwd=`
+
+```ts
+{ ok: true, entryPath: string, entries: Array<{ relativePath: string, size: number, mtimeMs: number, kind: 'directory' | 'file' }>,
+  truncated: boolean }
+```
+- 递归深度 ≤ 4，条数上限 500，跳过 `.git` / `node_modules` / `_trash` / `_disabled` / `.system`。
+- `relativePath` 一律用 `/` 分隔；不返回绝对路径。
+
+`GET /skill-manager/api/skill/file?rootId=&dirName=&kind=&state=&file=<relativePath>&cwd=`
+
+```ts
+{ ok: true, file: string, size: number, mtimeMs: number, hash: string,
+  encoding: 'utf8' | 'binary' | 'too-large', content?: string }
+```
+- 文本 ≤ 256 KiB 返回 `content`；超限 `encoding: 'too-large'` 且不带内容；含 NUL 字节判为 `binary`。
+- `file` 必须是技能目录内的相对路径：拒绝绝对路径、`..` 段、空段。
+
+`POST /skill-manager/api/skill/file`
+
+```ts
+// 请求
+{ rootId, dirName, kind, state?, file, content: string, hash?: string, cwd? }
+// 成功 200
+{ ok: true, file: string, hash: string, size: number }
+```
+- 只允许写**已存在**文件（新建文件走 `skill/create` 的正文，资源文件暂不支持新建）。
+- 给了 `hash` 就必须与磁盘一致，否则 409 `conflict`。
+- 只读根 → 403；内容 > 256 KiB → 413；路径越界/非法 → 400；不存在 → 404。
+- 写入原子（同目录临时文件 + rename），保留原 EOL 由调用方负责。
+
+### 8.4 正文搜索
+
+`GET /skill-manager/api/search?q=<string>&cwd=&limit=&rootId=`
+
+```ts
+{
+  q: string
+  matched: number                 // 命中的技能数
+  truncated: boolean              // 命中数 > 返回数
+  results: Array<{
+    key: string                   // 与 Skill.key 同口径
+    rootId: string; dirName: string; kind: 'directory' | 'file'; state: string
+    name: string; description: string
+    hits: Array<{ line: number, text: string }>   // 正文命中的行（最多 3 条）；仅 name/description 命中时为空
+  }>
+}
+```
+- 大小写不敏感子串匹配：`name` / `description` / `whenToUse` / 正文。
+- `q` 少于 2 个字符 → 400；`limit` 默认 50、最大 200；单文件上限 512 KiB，超限跳过正文只匹配元数据。
+- 只搜**已启用与已停用**条目，不搜 `_trash/`。
+
+### 8.5 市场卸载
+
+`POST /skill-manager/api/market/uninstall`
+
+```ts
+// 请求：按账本来源，或按目标根里的条目名
+{ rootId, repo: string, folder: string, cwd? } | { rootId, name: string, cwd? }
+// 成功 200
+{ ok: true, name: string, trashed: string, ledgerRemoved: boolean }
+```
+- 按 `{repo, folder}`：只作用于账本里 `rootPath` 等于该根、且 `{repo, folder}` 匹配的记录。
+- 按 `name`：直接针对该根下的同名条目（可卸载不是本面板安装的技能）。
+- 卸载 = 移入 `_trash/`（复用 §3.6 的命名规则），并从安装账本删除对应记录；账本写失败不影响卸载结果（`ledgerRemoved: false`）。
+- 目标不存在 → 404；只读根 → 403。
+
+### 8.6 自定义技能根（v3.1）
+
+运行时列表（进程内，立即参与后续扫描）与 profile 持久化（`cordis.patch.yml` 里 `- id: skill-manager` 的 `config.customSkillDirs`，重载插件后生效）是两份状态。
+
+`GET /skill-manager/api/roots/custom`
+
+```ts
+{
+  profilePath: string          // profile 补丁文件绝对路径（configEditor 不可用时按 $DSH_HOME/$DSH_PROFILE 推导）
+  writable: boolean            // 能否写持久化块（目录/文件可写、托管块未被手写行占用）
+  persisted: string[]          // profile 里已保存的 dirs
+  runtime: string[]            // 本次进程内临时添加的 dirs
+  dirs: Array<{ path: string, exists: boolean, source: 'config' | 'runtime' }>
+  error?: string               // 读取/解析 profile 失败时给出，其余字段仍返回
+}
+```
+
+`POST /skill-manager/api/roots/custom`
+
+```ts
+// 请求
+{ dirs: string[], persist?: boolean }
+// 成功 200
+{ ok: true, runtime: string[], persisted?: boolean, path?: string, backupPath?: string, requiresReload?: boolean }
+```
+- `dirs` 是**完整的运行时列表**（前端负责增删后的结果），不是增量；相对路径按请求 `cwd` 解析，去重、去空、拒绝非字符串。
+- `persist: true` 时把同一份列表写进 profile 补丁的托管块：
+  ```
+  # >>> dsh-skill-manager custom roots >>>
+  - id: skill-manager
+    config:
+      customSkillDirs:
+        - 'D:/my-skills'
+  # <<< dsh-skill-manager custom roots <<<
+  ```
+  写入前备份到 `<profileDir>/data/skill-manager/backup-<ts>.yml`，写入后用 YAML 重新解析校验，失败则回滚并 500。`requiresReload: true` 表示需要重载插件才按新配置扫描。
+- profile 里已存在**手写的** `- id: skill-manager` 顶层条目（无托管标记）→ 409 `conflict`，不碰用户的内容。
+
+### 8.7 技能包导出（v3.1）
+
+`POST /skill-manager/api/skill/export`
+
+```ts
+// 请求
+{ rootId, dirName, kind, state?, targetPath, cwd? }
+// 成功 200
+{ ok: true, path: string, files: number }
+```
+- `targetPath` 必须以 `.zip` / `.tgz` / `.tar.gz` 结尾；父目录必须已存在。
+- 目录技能打包整棵目录（含 `references/` `scripts/` `assets/`），单文件技能打包该 `.md`。
+- 用系统 `tar`（Windows 10+ / macOS / Linux 均自带 bsdtar，支持按扩展名自动压缩），**不新增 npm 依赖**；`tar` 不可用时 500 并说明。
+- 目标已存在 → 409 `exists`。
+- 导出只读根也允许（读操作）。
+
+### 8.8 压缩包导入（v3.1）
+
+`POST /skill-manager/api/skill/import` 的 `path` 可以是 `.zip` / `.tar` / `.tar.gz` / `.tgz`：
+
+- Host 先把压缩包解压到 `<tmp>/skill-manager-import-<ts>/`，再按 §3.13 的规则发现技能，结束后删除临时目录。
+- 解压项必须留在临时目录内（拒绝 `../` 与绝对路径条目），越界即整包拒绝（400 `bad-request`）。
+- 响应沿用 §3.13，额外带 `archive: true`。
+- 源压缩包本身不被修改。

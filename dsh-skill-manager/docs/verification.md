@@ -6,18 +6,19 @@
 
 | 项 | 值 |
 |---|---|
-| DSH 桌面版 | `0.2.1-rc.2` |
+| DSH 桌面版 | `0.2.1-rc.5`（本机安装版 `resources/app.asar` 直接核验） |
 | Cordis | `4.0.5` |
 | 宿主 web server | `@deepseek-ai/dsh-host-webserver`（`webServer.register({ kind:'exact', path, handler })`） |
 | 浏览器信任 | `connection.requestRejection`：`GET /?token=…` 换签名 cookie；`Sec-Fetch-Site: cross-site` 与跨 Origin 被 403 |
-| 技能发现 | `@deepseek-ai/dsh-skill-filesystem`：只扫根目录直接子项，BOM / 非法调用键会让宿主**静默丢弃**该技能 |
+| 技能发现 | `@deepseek-ai/dsh-skill-filesystem`：只扫根目录直接子项，BOM / 非法调用键会让宿主**静默丢弃**该技能；rc.5 与仓库 master 线的 skills 相关源码逐字节一致（`app.asar` 内 `src/*.ts` 对比），`settings.section.icon` 槽在 rc.5 已存在 |
 
 ## 2. 离线验证（不需要宿主）
 
 ```powershell
 cd plugin-library\dsh-skill-manager
-D:\nodejs\node.exe test\smoke.mjs        # 扫描 / lint / 启停 / 回收站 / 保存冲突 / 创建 / 三态调用 / 导入 / 市场账本 / 调用账本
-D:\nodejs\node.exe test\routes-smoke.mjs # 13 条路由：状态码、错误信封、同源门、认证栅栏、disposer
+D:\nodejs\node.exe test\smoke.mjs        # 45 条：扫描 / lint / 启停 / 保存冲突 / 创建 / 导入 / 市场账本 / 调用账本 / 回收站 / 资源文件 / 正文搜索 / 宿主快照
+D:\nodejs\node.exe test\routes-smoke.mjs # 41 条：23 条路由的状态码、错误信封、同源门、认证栅栏、disposer
+D:\nodejs\node.exe test\key-parity.mjs   # zh/en 字典 key 集合一致（388:388）
 ```
 
 两个脚本都用临时目录做 fixture，跑完自动清理；`smoke.mjs` 末尾还会只读地过一遍本机真实技能根。
@@ -72,7 +73,7 @@ $bin = "$env:LOCALAPPDATA\Programs\DeepSeek Harness\resources\app.asar\dsh\node_
 - 市场索引冷启动 ≈ 1.2 s（32 并发解析 + 5 分钟缓存），暖查询 ≈ 20 ms；串行实现曾需 ≈ 46 s，已废弃。
 - 隔离 profile 的浏览器端到端（0.1.3）：
   - 设置导航出现「技能」，列表按「自定义技能 / 用户技能」分组，组标题、来源、新建选项全部为中文（不再漏 Host 的英文 label）
-  - 导航图标（0.1.5）：`nav button` 行的子元素从 `[svg, span]` 变成 `[svg(glyph), svg(display:none), span]`，其余 5 行导航未被改动；放大到 8× 检查后字形为「卡片 + 星火」，stroke 1.3 与 DSH Medium 图标一致
+  - 导航图标（0.1.5 的 DOM 装饰方案已在 0.2.0 移除，改用宿主 `settings.section.icon` 槽；rc.5 的 `app.asar` 里该槽定义为 `{kind:'list', scope:'root', inline:true}`，`SettingsRoot` 用 `renderSlot('settings.section.icon', {size:16, active}, {only: row.id, fallback: navIcon(row.id)})` 渲染；离线 smoke 已确认注册项为 `["settings.section.icon","skill-manager", …]`，真机待复验）
   - 行内开关：`demo-skill` 关→开，`_disabled/` 往返成功，计数与「已停用」分组同步
   - 新建：模态创建 `ui-made` 成功 → 抽屉自动打开 → 该技能**立即出现在运行中 Agent 的技能目录**（宿主 watcher 生效）
   - 保存：编辑器改内容 → `已保存` → 磁盘同步；保存按钮在无改动时禁用
@@ -98,7 +99,45 @@ $bin = "$env:LOCALAPPDATA\Programs\DeepSeek Harness\resources\app.asar\dsh\node_
 - [ ] 删除：二次确认 → 条目消失，磁盘出现 `_trash/<name>@<时间戳>/`
 - [ ] 市场：搜索走服务端（能搜到不在首屏切片里的技能）；已安装显示徽章；安装后用户根出现目录
 - [ ] 深色：抽屉/模态/菜单正文对比正常；浅色：列表卡片与输入框有可辨层级
-- [ ] 键盘：`/` 聚焦搜索、Esc 关最上层、抽屉 Tab 不逃逸
+- [ ] 键盘：`/` 聚焦搜索（浮层打开时不抢焦点）、Esc 关最上层、抽屉 Tab 不逃逸
+- [ ] 未保存草稿时 Esc / 点遮罩 / 点关闭弹「丢弃修改？」确认；保存中/删除中直接拦截
+- [ ] 保存后抽屉头徽章与启停按钮立即跟随新状态（不用关掉重开）
+- [ ] 只读（bundled）技能：正文不可编辑、保存禁用、显示「内置技能只读」
+- [ ] BOM 文件：工具条出现「保存时去除 BOM」勾选，保存后文件头不再是 BOM
+- [ ] CRLF 文件编辑保存后仍是 CRLF
+- [ ] 列表上方出现诊断条（根不存在时），可关闭
+- [ ] 「宿主提供」分组列出磁盘根以外的技能（如 dsh-doc / office），只读、无开关
+- [ ] 回收站面板：恢复、单条永久删除（二次确认）、清空（二次确认）都生效
+- [ ] 详情「文件」页：references 里的 md 可读可改；二进制只显示说明
+- [ ] 正文搜索开关：搜到正文里的词，点结果打开详情
+- [ ] 市场「卸载」：确认后条目进 `_trash/`，市场不再显示「已安装」
+- [ ] 批量条含「模型不可调用 / 都不可调用」，失败条目名进 toast
+
+## 8. v0.2.0 变更（代码已验，真机待复验）
+
+本版把评估报告里的问题一次修完，改动分四组：
+
+1. **宿主对照**：`overview.hostOnly` / `hostSkills` + `GET /host-skills`。离线用桩服务验证了 `snapshot()` 的 `complete` 透传、`plugin-hub:*` 的 `pluginId` 解析、以及 `hostOnly` 按 name 取差集；真机上应能看到 dsh-doc / office* 这类 preset 技能出现在「宿主提供」分组里。
+2. **回收站闭环**：`GET /trash`、`POST /trash/restore`、`POST /trash/purge`（唯一真删入口，`all` 必须带 `confirm`），token 解析只认本插件命名规则，非本插件条目一律不动。
+3. **资源文件与搜索**：`GET /skill/files`、`GET|POST /skill/file`（同一路径按 method 分派）、`GET /search`（正文命中带行号，`q` 至少 2 字符）。
+4. **修正**：`/open` 校验目标存在并接受 `state`；`skill/save` 的 `hash` 改为必填；body 上限 512 KiB；`market.installed` 不再回退为同名技能数；删除/卸载销账；`create` 支持单文件形态、`_disabled/` 同名检查、64 字符上限；导入忽略 README 等说明文档；lint 口径对齐宿主（只认 6 个键，`description-long` 500 / 正文 8192 改为 `info`）；所有写操作补 `realpath` 校验。
+
+离线验证：`smoke.mjs` 45 条、`routes-smoke.mjs` 41 条、`key-parity.mjs` 388:388 全绿；Windows junction 逃逸用例在无开发者模式的机器上按 SKIP 处理。
+
+## 9. v0.3.0 变更（代码已验，真机待复验）
+
+补上评估里「刻意没做」的三类，并修掉两条架构风险：
+
+1. **自定义技能根 UI**：`GET|POST /roots/custom`。运行时列表立即参与扫描；`persist: true` 写 profile 补丁的托管块（`# >>> dsh-skill-manager custom roots >>>`），写前备份到 `<profileDir>/data/skill-manager/`、写后用 `yaml` 重新解析校验、顶层是 flow 空序列（`[]`）时先剥离再追加、手写 `- id: skill-manager` 条目一律 409 不接管。
+2. **技能包导出与压缩包导入**：`POST /skill/export`（系统 `tar -a`，按扩展名产出 zip/tgz）、`POST /skill/import` 识别 `.zip/.tar/.tar.gz/.tgz`（解压到 `mkdtemp` 临时目录后走同一套发现规则）。压缩包在**解压前**用 `tar -tf` 校验成员名（`..` / 绝对路径 / 盘符），解压后再做 realpath 复核与符号链接拒绝——两条路径都是 400 且不留半个文件。
+3. **架构风险收敛**：
+   - rank 表副本：新增 `applyHostShadowing`，用宿主 `snapshot()` 胜出者的 `path` 与本地 `path` 直接比较，命中即标 `shadowedByHost`（不再只靠本地 rank 推断）。
+   - `_disabled/` 依赖宿主只扫一层：新增 `findDisabledLeaks`，用「同名 + description 相同」确认宿主确实看到了停用条目，`overview.diagnostics` 给 `disabled-visible`。
+   - 账本 overwrite：`market/install` 的 `overwrite: true` 现在要求账本记录的 `targetPath` 与磁盘条目一致，否则 409——不再可能把用户手写的同名技能静默移进 `_trash/`。
+   - live Agent 依赖：`listHostSkills` 在没有 live Agent 时退到 `ctx.get('skills')` 的全局层，而不是直接降级。
+   - 仍保留的取舍：仍用 `node:fs` 而非 `ctx.fs`（改造成本高于收益，见 README「已知限制」）。
+
+离线验证：`smoke.mjs` 45 条（新增压缩包往返/越界、运行时根规范化与去重、宿主胜出者校验、停用泄漏）、`routes-smoke.mjs` 41 条（新增 `/roots/custom` 读写成块、`/skill/export` 409/400、导出→删除→从压缩包导入的完整回路）、`key-parity.mjs` 388:388 全绿。
 
 ## 7. 主页面快速入口（0.1.6）
 

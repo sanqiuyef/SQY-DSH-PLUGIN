@@ -11,15 +11,22 @@
  */
 
 import assert from 'node:assert/strict';
-import { mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, mkdir, readFile, rm, stat, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 
 import { resolveRoots } from '../lib/roots.js';
-import { scanAll } from '../lib/scan.js';
+import { isInsideReal, scanAll } from '../lib/scan.js';
 import { readSkill, saveSkill, createSkill, setInvocation } from '../lib/skill-file.js';
 import { setSkillEnabled, trashSkill } from '../lib/toggle.js';
 import { importSkillPackage } from '../lib/import.js';
+import { applyHostShadowing, findDisabledLeaks, listPluginSkills, listHostSkills } from '../lib/plugin-skills.js';
+import { mergeDirs, runtimeDirs, setRuntimeDirs } from '../lib/custom-roots.js';
+import { createArchive, extractArchive, isArchivePath } from '../lib/archive.js';
+import { analyzeContent } from '../lib/parse.js';
+import { listSkillFiles, readSkillFile, writeSkillFile } from '../lib/resource.js';
+import { searchSkills } from '../lib/search.js';
+import { listTrash, purgeTrash, restoreTrash } from '../lib/trash.js';
 import {
   clearMarketCache,
   installFromMarket,
@@ -381,7 +388,8 @@ try {
     const result = await importSkillPackage({ root, sourcePath: incoming });
     assert.deepEqual(result.imported.map((entry) => entry.name).sort(), ['deep-import', 'flat-import', 'imported-bundle']);
     assert.ok(result.skipped.some((entry) => entry.code === 'invalid' && entry.issue === 'description-missing'));
-    assert.ok(result.skipped.some((entry) => entry.code === 'invalid' && entry.name === 'readme'));
+    // 包里的说明文档不是技能，也不该出现在「跳过」列表里刷噪音。
+    assert.equal(result.skipped.some((entry) => entry.name === 'readme'), false);
     // 整包复制：references 一起走
     assert.match(await readFile(join(rootPath, 'imported-bundle', 'references', 'notes.md'), 'utf8'), /notes/);
     const scanned = await scanAll({ roots: [root] });
@@ -636,8 +644,300 @@ await check('real user root scans without diagnostics of level error', () => {
   assert.equal(errorDiagnostics.length, 0);
 });
 
-const marketDir = join(resolved.dshHome, 'skills-management', 'market');
-const summary = await marketSummary({ marketDir });
+/* ------------------------------------------------------------------ *
+ * v3 能力：回收站 / 资源文件 / 正文搜索 / 新建形态 / lint 口径
+ * ------------------------------------------------------------------ */
+
+const v3RootPath = join(base, 'v3-skills');
+await mkdir(v3RootPath, { recursive: true });
+const v3Root = {
+  id: 'custom:9',
+  label: 'V3 fixture',
+  source: 'custom',
+  rank: 300,
+  kind: 'custom',
+  path: v3RootPath,
+  exists: true,
+  writable: true,
+};
+
+await check('trash lists, restores, refuses a taken target and purges only its own entries', async () => {
+  await mkdir(join(v3RootPath, 'trash-me'), { recursive: true });
+  await writeFile(join(v3RootPath, 'trash-me', 'SKILL.md'), goodFrontmatter.replace('alpha', 'trash-me'), 'utf8');
+  await writeFile(join(v3RootPath, 'notes.txt'), 'not a skill', 'utf8');
+
+  const trashed = await trashSkill({ roots: [v3Root], rootId: v3Root.id, dirName: 'trash-me', kind: 'directory' });
+  assert.ok(trashed.trashed.includes('_trash'));
+
+  const listed = await listTrash({ roots: [v3Root], rootId: v3Root.id });
+  assert.equal(listed.roots.length, 1);
+  const entry = listed.roots[0].entries.find((candidate) => candidate.name === 'trash-me');
+  assert.ok(entry);
+  assert.equal(entry.kind, 'directory');
+  assert.ok(entry.token.startsWith('trash-me@'));
+
+  const restored = await restoreTrash({ roots: [v3Root], rootId: v3Root.id, token: entry.token });
+  assert.match(restored.restored, /trash-me$/);
+  assert.equal((await stat(join(v3RootPath, 'trash-me', 'SKILL.md'))).isFile(), true);
+
+  // 目标已被占：默认 409，overwrite 才把现有条目再次停进 _trash
+  const again = await trashSkill({ roots: [v3Root], rootId: v3Root.id, dirName: 'trash-me', kind: 'directory' });
+  assert.ok(again.trashed);
+  const parked = (await listTrash({ roots: [v3Root], rootId: v3Root.id })).roots[0].entries[0];
+  await mkdir(join(v3RootPath, 'trash-me'), { recursive: true });
+  await writeFile(join(v3RootPath, 'trash-me', 'SKILL.md'), goodFrontmatter.replace('alpha', 'trash-me'), 'utf8');
+  await assert.rejects(
+    () => restoreTrash({ roots: [v3Root], rootId: v3Root.id, token: parked.token }),
+    /已存在/,
+  );
+  await restoreTrash({ roots: [v3Root], rootId: v3Root.id, token: parked.token, overwrite: true });
+
+  // purge 必须显式 confirm，且只清 _trash 里自己命名规则的条目
+  await trashSkill({ roots: [v3Root], rootId: v3Root.id, dirName: 'trash-me', kind: 'directory' });
+  await assert.rejects(() => purgeTrash({ roots: [v3Root], rootId: v3Root.id, all: true }), /confirm/);
+  const purged = await purgeTrash({ roots: [v3Root], rootId: v3Root.id, all: true, confirm: true });
+  assert.ok(purged.removed.length >= 1);
+  assert.equal((await listTrash({ roots: [v3Root], rootId: v3Root.id })).counts.total, 0);
+  assert.equal((await stat(join(v3RootPath, 'notes.txt'))).isFile(), true);
+});
+
+await check('resource files list, refuse escapes, and write with a hash guard', async () => {
+  await mkdir(join(v3RootPath, 'with-assets', 'references'), { recursive: true });
+  await writeFile(join(v3RootPath, 'with-assets', 'SKILL.md'), goodFrontmatter.replace('alpha', 'with-assets'), 'utf8');
+  await writeFile(join(v3RootPath, 'with-assets', 'references', 'a.md'), '# a\n', 'utf8');
+  await writeFile(join(v3RootPath, 'with-assets', 'bin.dat'), Buffer.from([0, 1, 2, 3]));
+
+  const files = await listSkillFiles({ roots: [v3Root], rootId: v3Root.id, dirName: 'with-assets', kind: 'directory', state: 'enabled' });
+  assert.ok(files.entries.some((candidate) => candidate.relativePath === 'references/a.md'));
+  assert.ok(files.entries.some((candidate) => candidate.relativePath === 'bin.dat'));
+
+  const text = await readSkillFile({
+    roots: [v3Root], rootId: v3Root.id, dirName: 'with-assets', kind: 'directory', state: 'enabled', file: 'references/a.md',
+  });
+  assert.equal(text.encoding, 'utf8');
+  assert.match(text.content, /# a/);
+  assert.match(text.hash, /^[a-f0-9]{64}$/);
+
+  const binary = await readSkillFile({
+    roots: [v3Root], rootId: v3Root.id, dirName: 'with-assets', kind: 'directory', state: 'enabled', file: 'bin.dat',
+  });
+  assert.equal(binary.encoding, 'binary');
+  assert.equal(binary.content, undefined);
+
+  await assert.rejects(
+    () => readSkillFile({ roots: [v3Root], rootId: v3Root.id, dirName: 'with-assets', kind: 'directory', state: 'enabled', file: '../escape.md' }),
+    /相对路径|越界|非法/,
+  );
+
+  const written = await writeSkillFile({
+    roots: [v3Root], rootId: v3Root.id, dirName: 'with-assets', kind: 'directory', state: 'enabled',
+    file: 'references/a.md', content: '# b\n', expectedHash: text.hash,
+  });
+  assert.match(written.hash, /^[a-f0-9]{64}$/);
+  await assert.rejects(
+    () => writeSkillFile({
+      roots: [v3Root], rootId: v3Root.id, dirName: 'with-assets', kind: 'directory', state: 'enabled',
+      file: 'references/a.md', content: '# c\n', expectedHash: text.hash,
+    }),
+    /磁盘|变化|conflict/,
+  );
+  await assert.rejects(
+    () => writeSkillFile({
+      roots: [v3Root], rootId: v3Root.id, dirName: 'with-assets', kind: 'directory', state: 'enabled',
+      file: 'references/new.md', content: '# new\n',
+    }),
+    /不存在/,
+  );
+});
+
+await check('search matches the body with line hits and requires two characters', async () => {
+  await mkdir(join(v3RootPath, 'searchable'), { recursive: true });
+  await writeFile(
+    join(v3RootPath, 'searchable', 'SKILL.md'),
+    ['---', 'name: searchable', 'description: A metadata needle.', '---', '', 'line one', '', 'body-only-token here', ''].join('\n'),
+    'utf8',
+  );
+
+  const byMeta = await searchSkills({ roots: [v3Root], query: 'metadata needle' });
+  assert.ok(byMeta.results.some((entry) => entry.name === 'searchable'));
+
+  const byBody = await searchSkills({ roots: [v3Root], query: 'body-only-token' });
+  const hit = byBody.results.find((entry) => entry.name === 'searchable');
+  assert.ok(hit);
+  assert.ok(hit.hits.length >= 1);
+  assert.equal(typeof hit.hits[0].line, 'number');
+
+  await assert.rejects(() => searchSkills({ roots: [v3Root], query: 'x' }), /2/);
+});
+
+await check('lint follows the host key set and reports size hints as info', () => {
+  const unsupported = analyzeContent(
+    ['---', 'name: x', 'description: d', 'allowed-tools: Bash', '---', 'body'].join('\n'),
+    { dirName: 'x', kind: 'directory' },
+  );
+  assert.equal(unsupported.issues.some((entry) => entry.code === 'unknown-key'), true);
+
+  const tolerated = analyzeContent(
+    ['---', 'name: x', 'description: d', 'license: MIT', 'version: 1.0.0', '---', 'body'].join('\n'),
+    { dirName: 'x', kind: 'directory' },
+  );
+  assert.equal(tolerated.issues.some((entry) => entry.code === 'unknown-key'), false);
+
+  const longDescription = analyzeContent(
+    ['---', 'name: x', `description: ${'d'.repeat(600)}`, '---', 'b'].join('\n'),
+    { dirName: 'x', kind: 'directory' },
+  );
+  assert.equal(longDescription.issues.some((entry) => entry.code === 'description-long' && entry.level === 'info'), true);
+
+  const longBody = analyzeContent(
+    ['---', 'name: x', 'description: d', '---', '', 'x'.repeat(9000)].join('\n'),
+    { dirName: 'x', kind: 'directory' },
+  );
+  assert.equal(longBody.issues.some((entry) => entry.code === 'body-long' && entry.level === 'info'), true);
+
+  const mismatch = analyzeContent(
+    ['---', 'name: y', 'description: d', '---', 'b'].join('\n'),
+    { dirName: 'x', kind: 'directory' },
+  );
+  assert.equal(mismatch.issues.find((entry) => entry.code === 'name-mismatch')?.level, 'info');
+});
+
+await check('create supports a flat file, refuses a parked twin and an over-long name', async () => {
+  const flat = await createSkill({ roots: [v3Root], rootId: v3Root.id, name: 'flat-created', description: 'Flat created.', kind: 'file' });
+  assert.equal(flat.skill.kind, 'file');
+  assert.equal((await stat(join(v3RootPath, 'flat-created.md'))).isFile(), true);
+
+  await mkdir(join(v3RootPath, '_disabled', 'parked-one'), { recursive: true });
+  await writeFile(join(v3RootPath, '_disabled', 'parked-one', 'SKILL.md'), goodFrontmatter.replace('alpha', 'parked-one'), 'utf8');
+  await assert.rejects(
+    () => createSkill({ roots: [v3Root], rootId: v3Root.id, name: 'parked-one', description: 'x' }),
+    /停用/,
+  );
+  await assert.rejects(
+    () => createSkill({ roots: [v3Root], rootId: v3Root.id, name: 'a'.repeat(70), description: 'x' }),
+    /64/,
+  );
+});
+
+await check('a write target that is a junction pointing outside the root is refused', async () => {
+  const outside = join(base, 'outside-target');
+  await mkdir(outside, { recursive: true });
+  await writeFile(join(outside, 'SKILL.md'), goodFrontmatter, 'utf8');
+  try {
+    await symlink(outside, join(v3RootPath, 'linked-out'), 'junction');
+  } catch (error) {
+    // Windows 没有开发者模式/权限时建不了 junction：按 SKIP 处理，不判失败。
+    console.log(`  skip  junction unavailable: ${error?.code ?? error}`);
+    return;
+  }
+  assert.equal(await isInsideReal(v3RootPath, join(v3RootPath, 'linked-out', 'SKILL.md')), false);
+  await assert.rejects(
+    () => saveSkill({
+      roots: [v3Root], rootId: v3Root.id, dirName: 'linked-out', kind: 'directory',
+      expectedHash: undefined, content: 'x',
+    }),
+    /符号链接|越出/,
+  );
+});
+
+await check('host snapshot drives the plugin view and reports incompleteness', async () => {
+  const summaries = [
+    { name: 'searchable', description: 'from preset', source: 'custom', provider: 'filesystem', invocation: { modelInvocable: true, userInvocable: true } },
+    { name: 'plugin-only', description: 'from plugin', source: 'runtime', provider: 'plugin-hub:demo', invocation: { modelInvocable: true, userInvocable: true } },
+  ];
+  const service = { snapshot: async () => ({ skills: summaries, complete: false }) };
+  const agent = { session: { id: 's1', header: { cwd: base } }, ctx: { get: () => service } };
+  const ctx = {
+    get: (name) => (name === 'agents' ? { list: () => [agent] } : undefined),
+    workingDirectory: { get: () => base },
+  };
+
+  const host = await listHostSkills(ctx, { cwd: base });
+  assert.equal(host.available, true);
+  assert.equal(host.complete, false);
+  assert.equal(host.skills.length, 2);
+  assert.equal(host.skills.find((entry) => entry.name === 'plugin-only').pluginId, 'demo');
+
+  const plugin = await listPluginSkills(ctx, { cwd: base });
+  assert.equal(plugin.available, true);
+  assert.equal(plugin.skills.length, 1);
+  assert.equal(plugin.skills[0].provider, 'plugin-hub:demo');
+});
+
+/* ------------------------------------------------------------------ *
+ * v3.1 能力：压缩包 / 自定义根运行时列表 / 宿主胜出者校验 / 停用泄漏
+ * ------------------------------------------------------------------ */
+
+await check('archive round-trips a skill directory and rejects a bad extension', async () => {
+  const source = join(base, 'archive-src', 'archive-skill');
+  await mkdir(join(source, 'references'), { recursive: true });
+  await writeFile(join(source, 'SKILL.md'), goodFrontmatter.replace('alpha', 'archive-skill'), 'utf8');
+  await writeFile(join(source, 'references', 'n.md'), '# n\n', 'utf8');
+
+  const target = join(base, 'archive-skill.zip');
+  const created = await createArchive(source, target);
+  assert.equal(created.files >= 2, true);
+  assert.equal(isArchivePath(target), true);
+  assert.equal(isArchivePath(join(base, 'archive-skill.txt')), false);
+
+  const out = join(base, 'archive-out');
+  await mkdir(out, { recursive: true });
+  const extracted = await extractArchive(target, out);
+  assert.equal(extracted.entries >= 2, true);
+  // 包内保留一层顶层目录名（便于解压后就是一个完整文件夹）。
+  assert.match(await readFile(join(out, 'archive-skill', 'SKILL.md'), 'utf8'), /archive-skill/);
+  assert.match(await readFile(join(out, 'archive-skill', 'references', 'n.md'), 'utf8'), /# n/);
+
+  await assert.rejects(() => createArchive(source, join(base, 'archive-skill.txt')), /目标必须以/);
+});
+
+await check('runtime custom roots normalize, dedupe and merge', () => {
+  const dirs = setRuntimeDirs(['./rel-one', '   ', 'C:/abs-two', 'C:/abs-two'], base);
+  assert.equal(dirs.length, 2);
+  assert.equal(dirs[0], resolve(base, 'rel-one'));
+  assert.deepEqual(mergeDirs(['C:/abs-two'], dirs), ['C:/abs-two', resolve(base, 'rel-one')]);
+  assert.deepEqual(runtimeDirs(), dirs);
+  setRuntimeDirs([], base);
+  assert.deepEqual(runtimeDirs(), []);
+});
+
+await check('roots include the ZCode pair in rank order', () => {
+  const resolved2 = resolveRoots({ options: { zcodeHome: join(base, 'zcode-home') }, cwd: base });
+  const ids = resolved2.roots.map((root) => root.id);
+  const expected = ['project-dsh', 'project-zcode', 'project-agents', 'user-dsh', 'user-zcode', 'user-agents'];
+  const positions = expected.map((id) => ids.indexOf(id));
+  assert.equal(positions.every((index) => index >= 0), true);
+  assert.deepEqual(positions, [...positions].sort((left, right) => left - right));
+  assert.equal(resolved2.roots.find((root) => root.id === 'user-zcode').path, join(base, 'zcode-home', 'skills'));
+  assert.equal(resolved2.roots.find((root) => root.id === 'user-zcode').writable, true);
+});
+
+await check('host winner comparison overrides rank inference', () => {
+  const skills = [
+    { name: 'dup-a', path: join(base, 'x', 'SKILL.md'), state: 'enabled', issues: [], shadowed: false },
+    { name: 'dup-b', path: join(base, 'y', 'SKILL.md'), state: 'enabled', issues: [], shadowed: false },
+  ];
+  const host = [
+    { name: 'dup-a', provider: 'filesystem', path: join(base, 'x', 'SKILL.md') },
+    { name: 'dup-b', provider: 'other', path: join(base, 'z', 'SKILL.md') },
+  ];
+  const marked = applyHostShadowing(skills, host);
+  assert.equal(marked.marked, 1);
+  assert.equal(skills[0].shadowedByHost, undefined);
+  assert.equal(skills[1].shadowedByHost.provider, 'other');
+  assert.equal(skills[1].shadowed, true);
+});
+
+await check('a disabled skill the host can still see is reported as a leak', () => {
+  const parked = [{ name: 'parked', state: 'disabled', description: 'Same text.', rootId: 'user-dsh' }];
+  const leaks = findDisabledLeaks(parked, [{ name: 'parked', description: 'Same text.' }]);
+  assert.equal(leaks.length, 1);
+  assert.equal(leaks[0].code, 'disabled-visible');
+  // 同名不同内容：不是泄漏。
+  assert.equal(findDisabledLeaks(parked, [{ name: 'parked', description: 'Other text.' }]).length, 0);
+});
+
+const marketDir = join(resolved.dshHome, 'skills-management', 'market');const summary = await marketSummary({ marketDir });
 console.log(`  market: ${summary.available ? `${summary.repos} repos · ${summary.skills} skills` : 'not found'}`);
 if (summary.available) {
   const limited = await scanMarket({ marketDir, limit: 5 });

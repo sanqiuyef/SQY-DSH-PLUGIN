@@ -15,12 +15,14 @@ import { existsSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, isAbsolute, join, resolve } from 'node:path';
 
-/** Rank order — identical to `dsh-skill-filesystem`. */
+/** Rank order — mirrors the host's `dsh-skill-filesystem` table plus ZCode's pair. */
 export const ROOT_RANK = {
   'project-dsh': 100,
+  'project-zcode': 150,
   'project-agents': 200,
   custom: 300,
   'user-dsh': 400,
+  'user-zcode': 450,
   'user-agents': 500,
   bundled: 600,
 };
@@ -28,9 +30,11 @@ export const ROOT_RANK = {
 /** English fallback labels. The client localizes by `source`; these are last resort. */
 export const ROOT_LABEL = {
   'project-dsh': 'Project skills (.dsh)',
+  'project-zcode': 'Project skills (.zcode)',
   'project-agents': 'Project skills (.agents)',
   custom: 'Custom skills',
   'user-dsh': 'User skills (DSH)',
+  'user-zcode': 'ZCode user skills',
   'user-agents': 'User skills (agents)',
   bundled: 'Bundled skills',
 };
@@ -54,6 +58,20 @@ export function resolveDshHome(configured) {
 export function resolveAgentsHome(configured) {
   const value = firstNonEmpty(configured, process.env.DSH_AGENTS_HOME);
   return resolve(value ?? join(homedir(), '.agents'));
+}
+
+/**
+ * Resolve the ZCode home: explicit config, then `ZCODE_HOME`, then `~/.zcode`.
+ *
+ * ZCode keeps its skills in `<home>/.zcode/skills` and `<project>/.zcode/skills`,
+ * paired with `.agents/skills` at the same level (`.zcode` wins a name clash).
+ * Scanning them lets this panel manage skills authored for ZCode; when a user
+ * also keeps copies under `~/.dsh/skills`, the higher-rank copy wins and the
+ * ZCode one is reported as shadowed rather than silently duplicated.
+ */
+export function resolveZcodeHome(configured) {
+  const value = firstNonEmpty(configured, process.env.ZCODE_HOME);
+  return resolve(value ?? join(homedir(), '.zcode'));
 }
 
 /** First non-empty trimmed string. */
@@ -104,10 +122,12 @@ export function resolveRoots({ options = {}, cwd }) {
   const projectRoot = findProjectRoot(effectiveCwd);
   const dshHome = resolveDshHome(options.dshHome);
   const agentsHome = resolveAgentsHome(options.agentsHome);
+  const zcodeHome = resolveZcodeHome(options.zcodeHome);
   const bundledSkillDir = firstNonEmpty(options.bundledSkillDir, process.env.DSH_BUNDLED_SKILL_DIR);
 
   const rows = [
     { id: 'project-dsh', source: 'project-dsh', path: join(projectRoot, '.dsh', 'skills'), kind: 'project' },
+    { id: 'project-zcode', source: 'project-zcode', path: join(projectRoot, '.zcode', 'skills'), kind: 'project' },
     { id: 'project-agents', source: 'project-agents', path: join(projectRoot, '.agents', 'skills'), kind: 'project' },
     ...normalizeCustomDirs(options.customSkillDirs, effectiveCwd).map((path, index) => ({
       id: `custom:${index}`,
@@ -116,6 +136,7 @@ export function resolveRoots({ options = {}, cwd }) {
       kind: 'custom',
     })),
     { id: 'user-dsh', source: 'user-dsh', path: join(dshHome, 'skills'), kind: 'user', skipSystem: true },
+    { id: 'user-zcode', source: 'user-zcode', path: join(zcodeHome, 'skills'), kind: 'user' },
     { id: 'user-agents', source: 'user-agents', path: join(agentsHome, 'skills'), kind: 'user' },
     ...(bundledSkillDir === undefined
       ? []
@@ -134,7 +155,7 @@ export function resolveRoots({ options = {}, cwd }) {
     skipSystem: row.skipSystem === true,
   }));
 
-  return { cwd: effectiveCwd, projectRoot, dshHome, agentsHome, roots };
+  return { cwd: effectiveCwd, projectRoot, dshHome, agentsHome, zcodeHome, roots };
 }
 
 /** Find a root by id inside a resolved root list. */

@@ -23,9 +23,11 @@ import { createHash } from 'node:crypto';
 import { cp, mkdir, readdir, readFile, rename, rm, stat, writeFile } from 'node:fs/promises';
 import { basename, join, resolve } from 'node:path';
 
-import { badRequest, exists, notFound, readOnly } from './errors.js';
+import { badRequest, conflict, exists, notFound, readOnly } from './errors.js';
 import { analyzeContent } from './parse.js';
-import { isInside, isSafeSegment } from './scan.js';
+import { TRASH_DIR } from './roots.js';
+import { assertInsideReal, isInside, isSafeSegment } from './scan.js';
+import { writeFileAtomic } from './skill-file.js';
 
 /** How long a parsed market index stays warm. */
 const INDEX_TTL_MS = 5 * 60 * 1000;
@@ -438,7 +440,10 @@ export async function marketIndex(marketDir) {
 /**
  * Cheap market counters for the overview payload: folder counts without parsing.
  *
- * @param {{ marketDir: string, installedNames?: Iterable<string>, installState?: object }} input
+ * `installedNames` is kept for signature compatibility only: since contract
+ * v2 the count comes from the install ledger, never from a name match.
+ *
+ * @param {{ marketDir: string, installedNames?: Iterable<string>, installState?: object, rootPaths?: string[] }} input
  */
 export async function marketSummary({ marketDir, installedNames = [], installState, rootPaths }) {
   const dir = resolve(marketDir);
@@ -484,12 +489,86 @@ export async function marketSummary({ marketDir, installedNames = [], installSta
   }
 
   // With a ledger the number means "installed by this panel into a root of this
-  // request", not "a personal root happens to hold the same name"; without one,
-  // keep the old count.
+  // request"; without one it is 0 (contract §3.1). The old fallback counted
+  // same-named skills in a personal root, which read as a false positive for
+  // hand-written skills and was not an install at all.
+  // One {repo, folder} installed into two roots is still one install source.
   const installed = installState === undefined || installState === null
-    ? new Set(installedNames).size
-    : scopedInstallRecords(installState.installed, rootPaths).length;
+    ? 0
+    : uniqueInstalledSources(installState.installed, rootPaths);
   return { ...value, installed };
+}
+
+/**
+ * Distinct `{repo, folder}` install sources among the ledger records scoped to
+ * the roots of this request.
+ *
+ * @param {Record<string, object>} installed - the raw ledger map
+ * @param {string[]} [rootPaths] - absolute roots of this request
+ * @returns {number}
+ */
+function uniqueInstalledSources(installed, rootPaths) {
+  const sources = new Set();
+  for (const record of scopedInstallRecords(installed, rootPaths)) {
+    sources.add(`${record.repo}\u0000${record.folder}`);
+  }
+  return sources.size;
+}
+
+/**
+ * Find the ledger record that installed one entry, narrowed to a root.
+ *
+ * Used by the uninstall route: the ledger is the only place that knows which
+ * market `{repo, folder}` produced a given file on disk.
+ *
+ * @param {{ installed: Record<string, object>, rootPath: string, repo?: string,
+ *   folder?: string, name?: string }} input
+ * @returns {object | undefined}
+ */
+export function findInstallRecord({ installed, rootPath, repo, folder, name }) {
+  const wanted = pathKey(rootPath);
+  for (const record of Object.values(installed ?? {})) {
+    if (record === null || typeof record !== 'object') continue;
+    if (pathKey(record.rootPath) !== wanted) continue;
+    if (repo !== undefined && record.repo !== repo) continue;
+    if (folder !== undefined && record.folder !== folder) continue;
+    if (name !== undefined && record.name !== name) continue;
+    return record;
+  }
+  return undefined;
+}
+
+/**
+ * Drop one install record from the ledger (uninstall bookkeeping).
+ *
+ * A failure here never fails the uninstall: the files already moved, and the
+ * ledger only powers the "installed / has update" marks.
+ *
+ * @param {{ marketDir: string, rootPath: string, repo?: string, folder?: string, name?: string }} input
+ * @returns {Promise<boolean>} whether a record was removed
+ */
+export async function removeInstallRecord({ marketDir, rootPath, repo, folder, name }) {
+  try {
+    const state = await readInstallState(marketDir);
+    const wanted = pathKey(rootPath);
+    let removed = 0;
+    for (const [key, record] of Object.entries(state.installed)) {
+      if (record === null || typeof record !== 'object') continue;
+      if (pathKey(record.rootPath) !== wanted) continue;
+      if (repo !== undefined && record.repo !== repo) continue;
+      if (folder !== undefined && record.folder !== folder) continue;
+      if (name !== undefined && record.name !== name) continue;
+      delete state.installed[key];
+      removed += 1;
+    }
+    if (removed > 0) {
+      await writeInstallState(marketDir, state.installed);
+      clearMarketCache();
+    }
+    return removed > 0;
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -637,10 +716,20 @@ export async function installFromMarket({ marketDir, repo, folder, root, overwri
   let replaced = false;
   if (existingPath !== undefined) {
     if (overwrite !== true) throw exists(`用户技能根已存在同名技能：${name}`);
+    // 「更新」只覆盖本面板装的那份。账本记录的 targetPath 与磁盘上现有条目
+    // 不一致时（用户手写、别的来源装的、或装完删掉又重建），继续覆盖会把
+    // 别人的技能静默移进 `_trash/`——拒绝并要求手动处理。
+    const state = await readInstallState(dir);
+    const record = findInstallRecord({ installed: state.installed, rootPath: root.path, repo, folder });
+    const recordedTarget = typeof record?.targetPath === 'string' && record.targetPath !== '' ? record.targetPath : undefined;
+    if (recordedTarget === undefined || pathKey(recordedTarget) !== pathKey(existingPath)) {
+      throw conflict('目标根里的同名技能不是本面板安装的那份，未覆盖；请先手动处理它或改用其它名字。');
+    }
     // Overwrite still never deletes: the previous version is parked in `_trash/`.
-    await mkdir(join(root.path, '_trash'), { recursive: true });
+    await mkdir(join(root.path, TRASH_DIR), { recursive: true });
     const stamp = new Date().toISOString().replace(/[:.]/g, '-');
-    const backup = join(root.path, '_trash', `${name}@${stamp}`);
+    const backup = join(root.path, TRASH_DIR, `${name}@${stamp}`);
+    await assertInsideReal(root.path, existingPath);
     await rename(existingPath, backup);
     replaced = true;
   }
@@ -650,6 +739,7 @@ export async function installFromMarket({ marketDir, repo, folder, root, overwri
   if (sourceInfo.isDirectory()) {
     const staging = join(root.path, `.install-${name}-${stamp}`);
     try {
+      await assertInsideReal(root.path, targetDir);
       await cp(source, staging, { recursive: true, force: true });
       await rename(staging, targetDir);
     } catch (error) {
@@ -659,7 +749,10 @@ export async function installFromMarket({ marketDir, repo, folder, root, overwri
     targetPath = targetDir;
   } else {
     const text = await readFile(source, 'utf8');
-    await writeFile(targetFile, text, 'utf8');
+    await assertInsideReal(root.path, targetFile);
+    // A flat skill is one file too, so it goes through the same temp+rename
+    // path a directory copy gets: a crash never leaves a half-written SKILL.md.
+    await writeFileAtomic(targetFile, text);
     targetPath = targetFile;
   }
 

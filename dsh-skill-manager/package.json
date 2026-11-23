@@ -1,7 +1,7 @@
 {
   "name": "dsh-skill-manager",
-  "version": "0.1.7",
-  "description": "Skill manager for DeepSeek Harness — a ZCode-style settings page and a sidebar panel that list the skills on disk (project / user / custom / bundled), enable or disable them, edit SKILL.md inline with host-accurate lint, and install skills from the local market clone. · DSH 技能管理",
+  "version": "0.3.1",
+  "description": "Skill manager for DeepSeek Harness — a ZCode-style settings page and a sidebar panel that list the skills on disk (project / user / custom / bundled, DSH and ZCode roots) plus the host's own catalog, enable or disable them, edit SKILL.md and their reference files inline with host-accurate lint, browse the trash, search skill bodies, install or uninstall skills from the local market clone, manage custom skill roots, and export or import skill bundles as archives. · DSH 技能管理",
   "type": "module",
   "main": "lib/index.js",
   "license": "MIT",

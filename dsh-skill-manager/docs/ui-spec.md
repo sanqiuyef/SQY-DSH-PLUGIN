@@ -190,7 +190,7 @@ DSH 当前只暴露这些别名 token（运行时真实存在，`client/Theme.li
 - 客户端字典：`zh` / `en` 两套**同 key**，`ctx.locale.register('skillManager', { zh, en })`；`t = ctx.locale.bind('skillManager')`。
 - 所有可见文案走 `t('…')`，禁止硬编码中英文。数字/计数用插值函数（`{count}` 替换）。
 - 导航标签：`label: () => t('nav')` → zh「技能」/ en「Skills」。
-- 导航图标：宿主不开放 `icon`，外壳对未知 section id 兜底成齿轮。插件用自己的「卡片 + 星火」字形替换**仅本方那一行**（`installNavGlyph`，16×16 / stroke 1.3 / viewBox 0 0 16 16，参数与 DSH Medium 图标一致），实现见 `client/client.js` 的 `Settings-nav glyph` 区块与 `docs/nav-icon/设置导航图标改动规范.md`。装饰失败时保留齿轮，不抛错。
+- 导航图标：宿主提供 `settings.section.icon` 槽（`{kind:'list', scope:'root', inline:true}`，按 section id 过滤渲染，缺省回退 `navIcon(id)` 的齿轮）。插件注册 `id: 'skill-manager'`、`order: 21` 的「卡片 + 星火」16×16 / stroke 1.3 组件；老宿主没有该槽时 `try/catch` 静默退回齿轮，不做 DOM 手术、不挂文档观察器。
 - 要求：英文文案不得长到撑破行（行长按 2 倍中文预留）。
 
 ## 5. 无障碍与细节
@@ -205,7 +205,50 @@ DSH 当前只暴露这些别名 token（运行时真实存在，`client/Theme.li
 - 单文件 `client/client.js`，IIFE 工厂，**无 ESM import、无 JSX、无构建**；React 从 `require('react')` 取。
 - 样式：模块顶部一个 `CSS` 常量字符串，`data-plugin-css="dsh-skill-manager/styles"` 注入 `<head>`（去重，参考 memory-manager `ensureStyles`）。
 - 所有 class 前缀 `sm-`（skill manager），避免与宿主/其它插件冲突。
-- 组件拆分：`Page`（容器 + 数据）、`Toolbar`、`SkillRow`、`GroupHeader`、`DetailDrawer`、`CreateDialog`、`ImportDialog`、`PathDialog`、`BatchBar`、`MarketView`、`StatusMenu`、`MiniMenu`、`Switch`、`Badge`、`Toast`、`EmptyState`。
+- 组件拆分：`Page`（容器 + 数据）、`Toolbar`、`SkillRow`、`GroupHeader`、`HostOnlyGroup`、`SearchResults`、`DetailDrawer`、`SkillFilePage`、`CreateDialog`、`ImportDialog`、`TrashDialog`、`PathDialog`、`BatchBar`、`MarketView`、`StatusMenu`、`MiniMenu`、`Switch`、`Badge`、`Toast`、`EmptyState`。
 - 数据层：`useOverview(cwd)`（含刷新/乐观更新），统一 `apiRequest`；错误统一 `ApiError`。
 - 不得读取其它插件的 DOM / 样式；不得替换 app 根节点。
-- 结束时自检：`node --check client/client.js`（语法）+ 单文件 ≤ 3600 行。
+- 结束时自检：`node --check client/client.js`（语法）+ 单文件 ≤ 4600 行（v0.2.0 加入回收站、资源文件、正文搜索、宿主对照后实测 4522 行；继续增长时优先把独立浮层拆成同目录的第二文件，而不是压行）。
+
+## 7. v0.2.0 增补的交互
+
+以下界面元素在 v0.2.0 加入，遵守前六节的全部约束（只用主题 token、文案走 `t()`、`sm-` 前缀类名、模态/抽屉沿用现有组件）。
+
+### 7.1 工具栏新增
+
+- **回收站**按钮（`IconTrash`，右侧带计数徽章，计数来自懒加载的 `GET /trash`）：打开回收站面板。
+- **正文**开关（小号切换，紧邻搜索框）：开启后搜索改为调 `GET /search`，在列表上方插入「正文命中 N 条」分组，不改动主列表；关闭或清空查询时移除。
+
+### 7.2 列表新增分组
+
+- **宿主提供**（永远排在「异常」之后）：来自 `overview.hostOnly` 的只读技能，行显示 name / description / 来源（`provider`，插件技能显示「插件 · <pluginId>」），右侧徽章「宿主提供」，**整行不可点击、无开关**。分组标题下一行小字说明「来自宿主 provider（preset / bundled），不落磁盘根」。`hostSkills.complete === false` 时标题旁加 warn 徽章「宿主发现不完整」。
+- **诊断条**（列表上方，错误条之下）：渲染 `overview.diagnostics`，每条 message + 来源根；可关闭，本会话不再出现；空列表时同样渲染。
+
+### 7.3 详情抽屉新增「文件」页
+
+- 抽屉头部下方加标签：`SKILL.md` / `文件`（仅 `kind === 'directory'` 显示后者）。
+- 文件页左列（或上方）是目录树列表（`relativePath`、大小），选中文本文件后在下方显示等宽 textarea 与「保存」；`binary` / `too-large` 只显示说明、不给编辑器；只读根禁用保存。保存失败 409 时给「重新载入」。
+- 异步加载态用现有骨架；加载失败给错误条，不清空正文页。
+
+### 7.4 回收站面板
+
+- 与 `CreateDialog` 同风格的模态（宽 560px），按根分组列出条目（名称、时间、大小）。
+- 每条右侧「恢复」「删除」；删除与底部「清空回收站」都必须二次确认，文案写明**不可恢复**；恢复时目标已存在则询问是否覆盖（`overwrite: true`，旧目标再进回收站）。
+- 空状态「回收站是空的」；只读根不显示删除按钮。
+
+### 7.5 市场卸载与批量三态
+
+- 市场行在 `installed` 时增加 ghost-danger「卸载」按钮（`overwrite` 更新按钮旁边），二次确认文案写明移入 `_trash/`、可恢复。
+- 批量条在启用 / 停用 / 删除之后增加「模型不可调用」「都不可调用」两项，走 `action: 'invocation'`；失败详情与现有批量一致（前 3 条进 toast）。
+
+### 7.6 工作区显示
+
+- 工作区下拉的 tooltip 或下方小字显示 `overview.cwd` 与 `overview.projectRoot`（不同时才显示），用于诊断「路径写错导致列表为空」。
+
+### 7.7 v0.3.0 增补
+
+- **自定义根对话框**（header「自定义根」按钮）：`GET /roots/custom` 打开即读；分「profile 已保存」与「本次临时」两段，每条带移除，`exists:false` 给 warn「目录不存在」；底部输入 + 添加（回车可用，支持相对路径）；「仅本次生效」与「保存到 profile」两个提交；persist 成功显示 `path` / `backupPath`（等宽可复制）与「重载插件后生效」，409 时把 `error.message` 内联显示；`writable:false` 时禁用保存并在 title 说明。
+- **导出对话框**（详情抽屉底部「导出…」，只读技能也可用）：输入目标路径，本地校验扩展名 `.zip` / `.tgz` / `.tar.gz`，成功 toast 带 `path` 与文件数，409 提示目标已存在。
+- **导入对话框**：文案改为「文件夹 / .md / .zip / .tgz」，拖放压缩包同样只取路径字符串。
+- **遮蔽徽章优先级**：同一行只出一个遮蔽徽章，`shadowedByHost` > `shadowedByPlugin` > `shadowed`；`shadowedByHost` 的 title 带胜出者的 provider 与 path。
+- **`disabled-visible` 诊断**：停用约定失效（宿主能看到 `_disabled/` 里的技能）时，诊断条里该条用 **error 色**徽章，其余诊断保持 warn。

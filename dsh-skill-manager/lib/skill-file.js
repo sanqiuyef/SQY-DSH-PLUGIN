@@ -17,6 +17,7 @@ import { badRequest, conflict, exists, notFound, readOnly, tooLarge } from './er
 import { analyzeContent, buildFrontmatter, detectEol, hasBom, rewriteInvocation, stripBom } from './parse.js';
 import { rootById } from './roots.js';
 import {
+  assertInsideReal,
   buildSkill,
   contentHash,
   isInside,
@@ -27,6 +28,12 @@ import {
 
 /** Upper bound for one skill file (frontmatter + body). */
 export const MAX_CONTENT_BYTES = 256 * 1024;
+
+/** Upper bound for one skill name. The panel enforces the same limit. */
+export const MAX_NAME_CHARS = 64;
+
+/** Kebab-case skill name, identical to the host's grammar. */
+const KEBAB = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
 
 /** Default body of a newly created skill. */
 const DEFAULT_BODY = [
@@ -114,6 +121,7 @@ export async function saveSkill({ roots, rootId, dirName, kind, state, expectedH
     throw conflict('磁盘上的内容已变化（其他程序写入过），请重新载入后再保存。');
   }
 
+  await assertInsideReal(root.path, path);
   const next = shouldStripBom === true && hasBom(content) ? stripBom(content) : content;
   await writeFileAtomic(path, next);
   const analysis = analyzeContent(next, { dirName, kind });
@@ -168,6 +176,7 @@ export async function setInvocation({ roots, rootId, dirName, kind, state, expec
     throw badRequest('这份 frontmatter 的调用键无法安全改写（可能是行内式 YAML），请改用正文编辑器手动修改。');
   }
 
+  await assertInsideReal(root.path, path);
   await writeFileAtomic(path, rewritten.content);
   return { ok: true, hash: contentHash(rewritten.content), invocation: analysis.invocation, issues: analysis.issues };
 }
@@ -185,37 +194,67 @@ export async function writeFileAtomic(path, content) {
 }
 
 /**
- * Create a directory-bundle skill.
+ * Create a skill: a directory bundle (`<root>/<name>/SKILL.md`) by default, or a
+ * flat file (`<root>/<name>.md`) when `kind` is `'file'`. Both are host-native
+ * shapes; the panel used to create only the directory form.
+ *
+ * The name is checked against every place the entry could already live — the
+ * root and that root's `_disabled/` — so a created skill can never end up with a
+ * twin parked in `_disabled/` (the host would only see one of them, and the
+ * panel would show two rows with the same name).
  *
  * @param {{ roots: object[], rootId: string, name: string, description: string,
- *   whenToUse?: string, body?: string, invocation?: { model?: boolean, user?: boolean } }} input
+ *   whenToUse?: string, body?: string, invocation?: { model?: boolean, user?: boolean },
+ *   kind?: 'directory' | 'file' }} input
  */
-export async function createSkill({ roots, rootId, name, description, whenToUse, body, invocation }) {
+export async function createSkill({ roots, rootId, name, description, whenToUse, body, invocation, kind = 'directory' }) {
   const root = requireWritableRoot(roots, rootId);
   if (!isSafeSegment(name)) {
     throw badRequest('技能名必须是单个路径段（只能含小写字母、数字与连字符）');
   }
-  if (!/^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(name)) {
+  if (!KEBAB.test(name)) {
     throw badRequest('技能名必须是 kebab-case（小写字母、数字、连字符）');
+  }
+  if (name.length > MAX_NAME_CHARS) {
+    throw badRequest(`技能名不能超过 ${MAX_NAME_CHARS} 个字符`);
   }
   if (typeof description !== 'string' || description.trim() === '') {
     throw badRequest('description 必填：它会进入模型技能目录');
   }
   if (description.length > 1024) throw badRequest('description 不能超过 1024 字符');
+  if (kind !== 'directory' && kind !== 'file') throw badRequest(`不支持的技能类型：${String(kind)}`);
 
   const dirPath = skillEntryPath(root, name, 'directory', 'enabled');
   const flatPath = skillEntryPath(root, name, 'file', 'enabled');
-  for (const candidate of [dirPath, flatPath]) {
+  const parkedDir = skillEntryPath(root, name, 'directory', 'disabled');
+  const parkedFile = skillEntryPath(root, name, 'file', 'disabled');
+  for (const candidate of [dirPath, flatPath, parkedDir, parkedFile]) {
     const info = await stat(candidate).catch((error) => {
       if (error?.code === 'ENOENT' || error?.code === 'ENOTDIR') return undefined;
       throw error;
     });
-    if (info !== undefined) throw exists(`目标已存在：${candidate}`);
+    if (info !== undefined) {
+      const parked = candidate === parkedDir || candidate === parkedFile;
+      throw exists(parked ? `该名字已存在但处于停用状态：${candidate}（请先启用或删除它）` : `目标已存在：${candidate}`);
+    }
   }
 
   const content = `${buildFrontmatter({ name, description: description.trim(), whenToUse, invocation })}${body === undefined || body === '' ? DEFAULT_BODY : body}`;
+
+  if (kind === 'file') {
+    await assertInsideReal(root.path, flatPath);
+    try {
+      await writeFileAtomic(flatPath, content);
+    } catch (error) {
+      throw new Error(`创建技能失败：${error?.message ?? String(error)}`);
+    }
+    const skill = await buildSkill(root, name, 'file', false);
+    return { ok: true, skill };
+  }
+
   const skillPath = join(dirPath, 'SKILL.md');
   await mkdir(dirPath, { recursive: true });
+  await assertInsideReal(root.path, skillPath);
   try {
     await writeFileAtomic(skillPath, content);
   } catch (error) {

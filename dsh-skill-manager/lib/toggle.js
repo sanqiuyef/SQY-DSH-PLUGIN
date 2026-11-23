@@ -17,7 +17,7 @@ import { join } from 'node:path';
 
 import { badRequest, exists, notFound, readOnly } from './errors.js';
 import { DISABLED_DIR, TRASH_DIR, rootById } from './roots.js';
-import { isInside, isSafeSegment, skillEntryPath } from './scan.js';
+import { assertInsideReal, isInside, isSafeSegment, skillEntryPath } from './scan.js';
 
 /** Resolve one writable root or answer with the contract's error. */
 function requireWritableRoot(roots, rootId) {
@@ -63,6 +63,8 @@ export async function setSkillEnabled({ roots, rootId, dirName, kind, enabled })
   }
 
   if (!enabled) await mkdir(join(root.path, DISABLED_DIR), { recursive: true });
+  await assertInsideReal(root.path, from);
+  await assertInsideReal(root.path, to);
   await rename(from, to);
   return { ok: true, state: enabled ? 'enabled' : 'disabled', path: to };
 }
@@ -116,6 +118,8 @@ async function moveToTrash(root, source, dirName, kind) {
     if (counter > 50) throw exists('回收站命名冲突过多，请手动整理 _trash/');
   }
   if (!isInside(root.path, target)) throw badRequest('回收站路径越出技能根');
+  await assertInsideReal(root.path, source);
+  await assertInsideReal(root.path, target);
   await rename(source, target);
   return { ok: true, trashed: target };
 }
